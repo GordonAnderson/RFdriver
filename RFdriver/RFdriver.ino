@@ -104,7 +104,7 @@ int  TuneRFChan;
 
 #define MaxNumDown 5
 
-
+void msTimerIntercept(void);
 extern void (*mySysTickHook)(void);
 void (*mySysTickHook)(void) = msTimerIntercept;
 void msTimerIntercept(void)
