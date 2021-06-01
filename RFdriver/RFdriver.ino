@@ -2,7 +2,7 @@
 // RFdriver
 //
 //  This aplication is for the M0 processor on the rev 6.0 RFdriver hardware. The M0 processor 
-//  is the same prcessor used on the adafruit feather. The Arduino IDE is used to develope this
+//  is the same processor used on the adafruit feather. The Arduino IDE is used to develope this
 //  application. The M0 processor emulate the SEPROM used on the MIPS modules. This RFdriver 
 //  interfaces with the MIPS controller through the emulated SEPROM and the TWI interface.
 //  
@@ -949,6 +949,24 @@ void ReportRFchan2(void)
    serial->print(" V  : "); serial->println(rb[1].V);  
    serial->print(" I  : "); serial->println(rb[1].I);  
    serial->print(" PWR: "); serial->println(rb[1].PWR);  
+}
+
+void ReportRFlevelADC(int8_t chan)
+{
+  int val;
+  
+  if((chan != 1) && (chan != 2))
+  {
+    SetErrorCode(ERR_EEPROMWRITE);
+    SendNAK;
+    return;    
+  }
+  chan--;
+  val = AD5592readADC(AD5592_CS, rfdriver.RFCD[chan].RFpADCchan.Chan,100);
+  serial->print(val);
+  serial->print(",");
+  val = AD5592readADC(AD5592_CS, rfdriver.RFCD[chan].RFnADCchan.Chan,100);
+  serial->println(val);
 }
 
 void Debug(int i)

@@ -287,3 +287,151 @@ void tcDisable()
   TC5->COUNT16.CTRLA.reg &= ~TC_CTRLA_ENABLE;
   while (tcIsSyncing());
 }
+
+void ComputeCRCbyte(byte *crc, byte by)
+{
+  byte generator = 0x1D;
+
+  *crc ^= by;
+  for(int j=0; j<8; j++)
+  {
+    if((*crc & 0x80) != 0)
+    {
+      *crc = ((*crc << 1) ^ generator);
+    }
+    else
+    {
+      *crc <<= 1;
+    }
+  }
+}
+
+// Compute 8 bit CRC of buffer
+byte ComputeCRC(byte *buf, int bsize)
+{
+  byte generator = 0x1D;
+  byte crc = 0;
+
+  for(int i=0; i<bsize; i++)
+  {
+    crc ^= buf[i];
+    for(int j=0; j<8; j++)
+    {
+      if((crc & 0x80) != 0)
+      {
+        crc = ((crc << 1) ^ generator);
+      }
+      else
+      {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+// The function will program the FLASH memory by receiving a file from the USB connected host. 
+// The file must be sent in hex and use the following format:
+// First the FLASH address in hex and file size, in bytes (decimal) are sent. If the file can
+// be burned to FLASH an ACK is sent to the host otherwise a NAK is sent. The process stops
+// if a NAK is sent. 
+// If an ACK is sent to the host then the host will send the data for the body of the 
+// file in hex. After all the data is sent then a 8 bit CRC is sent, in decimal. If the
+// crc is correct and ACK is returned.
+void ProgramFLASH(char * Faddress,char *Fsize)
+{
+  static String sToken;
+  static uint32_t FlashAddress;
+  static int    numBytes,fi,val,tcrc;
+  static char   c,buf[3],*Token;
+  static byte   fbuf[256],b,crc;
+  static byte   vbuf[256];
+  static uint32_t start;
+
+  crc = 0;
+  FlashAddress = strtol(Faddress, 0, 16);
+  sToken = Fsize;
+  numBytes = sToken.toInt();
+  SendACK;
+  fi = 0;
+  FlashClass fc((void *)FlashAddress,numBytes);
+  for(int i=0; i<numBytes; i++)
+  {
+    start = millis();
+    // Get two bytes from input ring buffer and scan to byte
+    while((c = RB_Get(&RB)) == 0xFF) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
+    buf[0] = c;
+    while((c = RB_Get(&RB)) == 0xFF) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
+    buf[1] = c;
+    buf[2] = 0;
+    sscanf(buf,"%x",&val);
+    fbuf[fi++] = val;
+    ComputeCRCbyte(&crc,val);
+    if(fi == 256)
+    {
+      fi = 0;
+      // Write the block to FLASH
+      noInterrupts();
+      fc.erase((void *)FlashAddress, 256);
+      fc.write((void *)FlashAddress, fbuf, 256);
+      // Read back and verify
+      fc.read((void *)FlashAddress, vbuf, 256);
+      for(int j=0; j<256; j++)
+      {
+        if(fbuf[j] != vbuf[j])
+        {
+           interrupts();
+           serial->println("FLASH data write error!");
+           SendNAK;
+           return;   
+        }
+      }
+      interrupts();
+      FlashAddress += 256;
+      serial->println("Next");
+    }
+  }
+  // If fi is > 0 then write the last partial block to FLASH
+  if(fi > 0)
+  {
+    noInterrupts();
+    fc.erase((void *)FlashAddress, fi);
+    fc.write((void *)FlashAddress, fbuf, fi);
+    // Read back and verify
+    fc.read((void *)FlashAddress, vbuf, fi);
+    for(int j=0; j<fi; j++)
+    {
+      if(fbuf[j] != vbuf[j])
+      {
+         interrupts();
+         serial->println("FLASH data write error!");
+         SendNAK;
+         return;   
+      }
+    }
+    interrupts();
+  }
+  // Now we should see an EOL, \n
+  start = millis();
+  while((c = RB_Get(&RB)) == 0xFF) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
+  if(c == '\n')
+  {
+    // Get CRC and test, if ok exit else delete file and exit
+    while((Token = GetToken(true)) == NULL) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
+    sscanf(Token,"%d",&tcrc);
+    while((Token = GetToken(true)) == NULL) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
+    if((Token[0] == '\n') && (crc == tcrc)) 
+    {
+       serial->println("File received from host and written to FLASH.");
+       SendACK;
+       return;
+    }
+  }
+  serial->println("\nError during file receive from host!");
+  SendNAK;
+  return;
+TimeoutExit:
+  serial->println("\nFile receive from host timedout!");
+  SendNAK;
+  return;
+}

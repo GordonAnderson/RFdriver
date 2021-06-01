@@ -63,6 +63,9 @@ Commands  CmdArray[] =   {
 
   {"RRFCH1", CMDfunction, 0, (char *)ReportRFchan1},                      // Report RF channel 1 reads
   {"RRFCH2", CMDfunction, 0, (char *)ReportRFchan2},                      // Report RF channel 2 reads
+  
+  {"RRFLADC", CMDfunction, 1, (char *)ReportRFlevelADC},                  // Reports the raw ADC value for selected
+                                                                          // channel, 1 or 2
   // End of table marker
   {0},
 };

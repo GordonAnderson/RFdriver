@@ -112,5 +112,6 @@ bool UpdateADCvalue(uint8_t SPIcs, ADCchan *achan, float *value, float filter = 
 //bool UpdateADCvalue(uint8_t SPIcs, ADCchan *achan, float *value, float filter = FILTER);
 void ReportRFchan1(void);
 void ReportRFchan2(void);
+void ReportRFlevelADC(int8_t);
 
 #endif
