@@ -38,6 +38,10 @@ bool echoMode = false;
 Commands  CmdArray[] =   {
 // General commands
   {"GVER",  CMDstr, 0, (char *)Version},                                  // Report version
+  {"GNAME", CMDstr, 0, (char *)rfdriver.Name},                            // Report system name
+  {"SNAME", CMDstr, 1, (char *)rfdriver.Name},                            // Set system name
+  {"GREV", CMDfunction, 0, (char *)getRev},                               // Report system Rev
+  {"SREV", CMDfunction, 1, (char *)setRev},                               // Set system Rev
   {"GERR",  CMDint, 0, (char *)&ErrorCode},                               // Report the last error code
   {"MUTE",  CMDfunctionStr, 1, (char *)Mute},                             // Turns on and off the serial response from the MIPS system
   {"ECHO",  CMDbool, 1, (char *)&echoMode},                               // Turns on and off the serial echo mode where the command is echoed to host, TRUE or FALSE
@@ -51,15 +55,34 @@ Commands  CmdArray[] =   {
   {"DEBUG", CMDfunction, 1, (char *)Debug},                               // Debug function, its function varies
   {"THREADS", CMDfunction, 0, (char *)ListThreads},                       // List all threads, there IDs, and there last runtimes
   {"STHRDENA", CMDfunctionStr, 2, (char *)SetThreadEnable},               // Set thread enable to true or false
+  {"STWIADD", CMDfunctionStr, 1, (char *)SetTWIbaseAdd},                  // Set TWI base address in hex
+  {"GTWIADD", CMDfunction, 0, (char *)GetTWIbaseAdd},                     // Return TWI base address in hex
 // RFdriver commands
-  {"SRFDRV1", CMDfloat, 1, (char *)&rfdriver.RFCD[0].DriveLevel},         // Set RF drive level, channel 1
-  {"GRFDRV1", CMDfloat, 0, (char *)&rfdriver.RFCD[0].DriveLevel},         // Return RF drive level, channel 1
-  {"SRFDRV2", CMDfloat, 1, (char *)&rfdriver.RFCD[1].DriveLevel},         // Set RF drive level, channel 2
-  {"GRFDRV2", CMDfloat, 0, (char *)&rfdriver.RFCD[1].DriveLevel},         // Return RF drive level, channel 2
-  {"SRFFRQ1", CMDint, 1, (char *)&rfdriver.RFCD[0].Freq},                 // Set RF frequency, channel 1
-  {"GRFFRQ1", CMDint, 0, (char *)&rfdriver.RFCD[0].Freq},                 // Return RF frequency, channel 1
-  {"SRFFRQ2", CMDint, 1, (char *)&rfdriver.RFCD[1].Freq},                 // Set RF frequency, channel 2
-  {"GRFFRQ2", CMDint, 0, (char *)&rfdriver.RFCD[1].Freq},                 // Return RF frequency, channel 2
+  {"SRFFRQ", CMDfunction, 2, (char *)RFfreq},		         // Set RF frequency
+  {"SRFVLT", CMDfunctionStr, 2, (char *)RFvoltage},	     // Set RF output voltage
+  {"SRFDRV", CMDfunctionStr, 2, (char *)RFdrive},        // Set RF drive level
+  {"GRFFRQ", CMDfunction, 1, (char *)RFfreqReport},	     // Report RF frequency
+  {"GRFPPVP", CMDfunction, 1, (char *)RFvoltageReportP}, // Report RF output voltage, positive phase
+  {"GRFPPVN", CMDfunction, 1, (char *)RFvoltageReportN}, // Report RF output voltage, negative phase
+  {"GRFDRV", CMDfunction, 1, (char *)RFdriveReport},     // Report RF drive level in percentage
+  {"GRFVLT", CMDfunction, 1, (char *)RFvoltageReport},   // Report RF output voltage setpoint
+  {"GRFPWR", CMDfunction, 1, (char *)RFheadPower},       // Report RF head power draw
+  {"GRFMODE", CMDfunction, 1, (char *)RFmodeReport},     // Report RF mode (MANUAL | AUTO) for the selected channel
+  {"SRFMODE", CMDfunctionStr, 2, (char *)RFmodeSet},     // Sets the RF mode (MANUAL | AUTO) for the selected channel
+  {"GRFALL", CMDfunction, 0, (char *)RFreportAll},       // Reports Freq, RFVpp + and - for each RF channel in system
+  {"TUNERFCH", CMDfunction, 1, (char *)RFautoTune},      // Auto tune the select RF channel
+  {"RETUNERFCH", CMDfunction, 1, (char *)RFautoRetune},  // Auto retune the select RF channel, start and current freq and drive
+  {"SRFCAL", CMDfunctionLine, 1, (char *)RFcalParms},    // Sets the RF calibration parameters, channel,slope,intercept  
+  {"RFCALP", CMDfunctionStr, 2, (char *)RFcalP},         // Adjust the calibration for a RF+ channel, channel,actual level in Vp-p, enter negative to set defaults
+  {"RFCALN", CMDfunctionStr, 2, (char *)RFcalN},         // Adjust the calibration for a RF- channel, channel,actual level in Vp-p, enter negative to set defaults
+  {"SRFPL", CMDfunction, 2, (char *)SetRFpwrLimit},      // Sets the RF power limit for the given channel, in watts
+  {"GRFPL", CMDfunction, 1, (char *)GetRFpwrLimit},      // Returns the RF power limit for the given channel, in watts
+  {"RFPWLC", CMDfunctionStr, 2, (char *)genPWLcalTable}, // Generate piecewise linear calibration table for selected channel and phase
+
+  {"SMAXDRV", CMDfunction, 2, (char *)setMaxDrive},      // Set max RF drive percentage
+  {"GMAXDRV", CMDfunction, 1, (char *)getMaxDrive},      // Get max RF drive percentage
+  {"SMAXPWR", CMDfunction, 2, (char *)setMaxPower},      // Set max power
+  {"GMAXPWR", CMDfunction, 1, (char *)getMaxPower},      // Get max power
 
   {"RRFCH1", CMDfunction, 0, (char *)ReportRFchan1},                      // Report RF channel 1 reads
   {"RRFCH2", CMDfunction, 0, (char *)ReportRFchan2},                      // Report RF channel 2 reads
@@ -187,6 +210,49 @@ char *GetToken(bool ReturnComma)
       return Token;
     }
   }
+}
+
+char  *UserInput(char *message, void (*function)(void))
+{
+  char *tkn;
+  
+  // Flush the input ring buffer
+  RB.Head=RB.Tail=RB.Count=RB.Commands=0;
+  serial->print(message);
+  // Wait for a line to be detected in the ring buffer
+  while(RB.Commands == 0) 
+  {
+    ProcessSerial(false);
+    if(function != NULL) function();
+  }
+  // Read the token
+  tkn = GetToken(true);
+  if(tkn != NULL) if(tkn[0] == '\n') tkn = NULL;
+  return tkn;
+}
+
+int   UserInputInt(char *message, void (*function)(void))
+{
+  char   *tkn;
+  String arg;
+
+  tkn = UserInput(message,function);
+  // Flush the input ring buffer
+  RB.Head=RB.Tail=RB.Count=RB.Commands=0;
+  arg = tkn;
+  return arg.toInt();
+}
+
+float UserInputFloat(char *message, void (*function)(void))
+{
+  char   *tkn;
+  String arg;
+
+  tkn = UserInput(message,function);
+  // Flush the input ring buffer
+  RB.Head=RB.Tail=RB.Count=RB.Commands=0;
+  arg = tkn;
+  return arg.toFloat();
 }
 
 void ExecuteCommand(Commands *cmd, int arg1, int arg2, char *args1, char *args2, float farg1)

@@ -116,4 +116,8 @@ void DelayCommand(int dtime);
 void SetThreadEnable(char *, char *);
 void ListThreads(void);
 
+char  *UserInput(char *message, void (*function)(void));
+int   UserInputInt(char *message, void (*function)(void));
+float UserInputFloat(char *message, void (*function)(void));
+
 #endif /* SERIAL_H_ */

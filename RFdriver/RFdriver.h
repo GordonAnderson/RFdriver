@@ -7,6 +7,9 @@
 #define SIGNATURE  0xAA55A5A5
 #define DRVPWMFREQ 50000
 
+#define MinFreq    400000
+#define MaxFreq    5000000
+
 #define ESC   27
 #define ENQ   5
 
@@ -30,6 +33,10 @@
                                          // is gated off, int
 #define TWI_SET_GATEDIS        0x10      // Disable the gate interrupt
 #define TWI_SET_GATE           0x11      // Gates the RF off if true, on if false. 
+#define TWI_SET_PWL            0x12      // Sets a table entry in the piecewise linear look up table.
+                                         // channel (byte), phase (byte), index (byte), voltage (word) 
+#define TWI_SET_PWL_N          0x13      // Sets the number of piecewise linear look up table entries.
+                                         // channel (byte), phase (byte), entries (byte) 
                                          
 
 #define TWI_SERIAL             0x27      // This command enables the TWI port to process serial commands
@@ -41,6 +48,20 @@
 #define TWI_READ_TUNE          0x85      // Returns the auto tune flag, bool
 #define TWI_READ_CALP          0x86      // Returns the calibration parameters for VRFP, m and b. two floats
 #define TWI_READ_CALN          0x87      // Returns the calibration parameters for VRFN, m and b. two floats
+#define TWI_READ_PWL           0x88      // Returns the value and ADCvalue (words) for the requested PWL table entry
+                                         // channel (byte), phase (byte), entry number (byte)
+#define TWI_READ_PWL_N         0x89      // Returns the the number of PWL table entries
+                                         // channel (byte), phase (byte)
+
+#define  MAXPWL 10
+// This data structure is used for the piece wise linear calibration
+// function.
+typedef struct
+{
+  uint8_t   num;
+  uint16_t  ADCvalue[MAXPWL];
+  uint16_t  Value[MAXPWL];
+} PWLcalibration;
 
 enum RFdriverMode
 {
@@ -91,7 +112,11 @@ typedef struct
   // These parameters really belong in RFchnnelData but there were added after release so placing at end of struct give backwards compatability
   char           RFgateDI[2];       // Gate input, 0 if not used otherwise its the input P-X
   int8_t         RFgateTrig[2];     // Gate level, 0,CHANGE,RISING, or FALLING
-  int            Signature;         // Must be 0xAA55A5A5 for valid data
+  uint           Signature;         // Must be 0xAA55A5A5 for valid data
+  float          PowerLimit;        // This changes the MIPS UI upper limit
+  // Piece wise linear calibration data structures
+  PWLcalibration PWLcal[2][2];   // Piece wise linear data structures, first index is RF channel, second
+                                 // is phase, 0 for RF+ and 1 of RF-
 } RFdriverData;
 
 
@@ -108,10 +133,41 @@ typedef struct
 extern RFdriverData  rfdriver;
 
 // prototypes
+void ProcessSerial(bool scan = true);
+
 bool UpdateADCvalue(uint8_t SPIcs, ADCchan *achan, float *value, float filter = FILTER, float (*c2v)(int,ADCchan *) = Counts2Value);
 //bool UpdateADCvalue(uint8_t SPIcs, ADCchan *achan, float *value, float filter = FILTER);
 void ReportRFchan1(void);
 void ReportRFchan2(void);
 void ReportRFlevelADC(int8_t);
+void SetTWIbaseAdd(char *add);
+void GetTWIbaseAdd(void);
+
+void RFfreq(int channel, int freq);
+void RFvoltage(char *Chan, char *Val);
+void RFdrive(char *Chan, char *Val);
+void RFfreqReport(int channel);
+void RFvoltageReportP(int channel);
+void RFvoltageReportN(int channel);
+void RFdriveReport(int channel);
+void RFvoltageReport(int channel);
+void RFheadPower(int channel);
+void RFmodeReport(int channel);
+void RFmodeSet(char *chan, char *mode);
+void RFreportAll(void);
+void RFautoTune(int channel);
+void RFautoRetune(int channel);
+void RFcalParms(void);
+void RFcalP(char *channel, char *Vpp);
+void RFcalN(char *channel, char *Vpp);
+void GetRFpwrLimit(int channel);
+void SetRFpwrLimit(int channel, int Power);
+void genPWLcalTable(char *channel, char *phase);
+void getRev(void);
+void setRev(int rev);
+void setMaxDrive(int channel, int Drive);
+void getMaxDrive(int channel);
+void setMaxPower(int channel, int Power);
+void getMaxPower(int channel);
 
 #endif

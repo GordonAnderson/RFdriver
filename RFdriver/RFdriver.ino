@@ -7,7 +7,9 @@
 //  interfaces with the MIPS controller through the emulated SEPROM and the TWI interface.
 //  
 //  The emulated SEPROM memory configuration matches that on the previous hardware versions 
-//  of the RFdriver.
+//  of the RFdriver. The interface to this module uses TWI and the address is derived from the
+//  emulated SEPROM. The address set via jumpers defines the SEPROM interface and this address
+//  ored with 0x20 defines the TWI command interface.
 //  
 //  The MIPS RFdriver firmware must use the RFdriver2, this is set in the MIPS variants.h
 //  file.
@@ -22,15 +24,31 @@
 //  Becasue this interface uses less recources that the older RFdrivers the MIPS system RFdriver2
 //  will support 4 module for a total of 8 RF channels.
 //
+//  MIPS supports SEPROM address of 0x50,0x52,0x54, and 0x56. For these base addresses the 
+//  command interface address is 0x70, 0x72, 0x74, and 0x76. This module supports extended
+//  address by supporting 0x60,0x62,0x64, and 0x66. For these base addresses the command interface
+//  address is 0x78, 0x7A, 0x7C, and 0x7E. Note! you cannot mix these modules using standard 
+//  addressing and extended addressing.
+//
 //  Gordon Anderson
 //  Rev 1.0, Initial release
 //  Rev 1.1, Jan 4, 2020
 //    1.) Update the voltage level reading to make sure it never goes negative.
+//  Rev 1.2, June 7, 2021
+//    1.) Added piecewise linear calibration support
+//    2.) Added extended addressing capability
+//  Rev 1.3, August 13, 2023
+//    1.) Updated the system to support stand alone operation through the USB port
+//        Add the following:
+//        - Update all the host commands to use the same syntax as MIPS
+//        - Added GNAME and SNAME commands
+//        - Added command for rev edit
 //
 #include <Arduino.h>
 #include <variant.h>
 #include <wiring_private.h>
 #include "SERCOM.h"
+#include <avr/dtostrf.h>
 #include <Thread.h>
 #include <ThreadController.h>
 
@@ -49,12 +67,13 @@
 SoftwareI2C WireS1;
 
 int8_t        TWIadd = 0x50;
-const char    Version[] PROGMEM = "RFdriver version 1.1, Jan 4, 2020";
+const char    Version[] PROGMEM = "RFdriver version 1.3, August 13, 2023";
 RFdriverData  rfdriver;
 RFDRVstate    sdata[2];
+int           recAdd;    
 int           Eaddress = 0;
-int           recAdd;
-uint8_t       Ebuf[512];
+uint32_t      ebuf[128];  // long word aligned 512 byte buffer
+uint8_t       *Ebuf = (uint8_t *)ebuf;  // Byte pointer to buffer
 RFdriverData  *fptr = (RFdriverData *)Ebuf;
 bool          update = true;
 bool          ReturnAvalible = false;
@@ -64,6 +83,12 @@ float         vcal;         // calibration voltage
 int           ccal;         // channel to calibrate
 bool          Pcal=false;   // true to to calibrate the positive channel
 bool          Ncal=false;   // true to to calibrate the negative channel
+
+uint8_t       PWLch;
+uint8_t       PWLph;
+uint8_t       PWLn;
+int           PWLvalue = -1;
+
 // Gate variables
 bool          Gated[2]  = {false,false};
 // Gate ISR variables
@@ -89,7 +114,12 @@ RFdriverData  RFDD_A_Rev_1 = {sizeof(RFdriverData),"RFdriver", 3, 2, 0x20, 0x69,
                               1000000, 0.0, 0, RF_MANUAL, 50.0, 20.0, 7, 6, 32, 320, 7, 32, 320, 2, 2383.09, 0, 3, 2621.4, 0,
                               0,0,
                               -1,-1,
-                              SIGNATURE
+                              SIGNATURE,
+                              50,
+                              9,6391,8051,9690,11382,12972,14830,16443,18287,20129,0,100,200,300,400,500,600,700,800,900,0,
+                              9,6391,8051,9690,11382,12972,14830,16443,18287,20129,0,100,200,300,400,500,600,700,800,900,0,
+                              9,6391,8051,9690,11382,12972,14830,16443,18287,20129,0,100,200,300,400,500,600,700,800,900,0,
+                              9,6391,8051,9690,11382,12972,14830,16443,18287,20129,0,100,200,300,400,500,600,700,800,900,0,
                              };
 
 // Auto tune parameters
@@ -175,6 +205,11 @@ void requestEventProcessor(void)
 // Send up to 32 bytes.
 void requestEvent(void)
 {
+  int cmd_add;
+
+  if((TWIadd & 0x20) != 0) cmd_add =  TWIadd | 0x18;
+  else cmd_add = TWIadd | 0x20;
+ 
   Eaddress &= ~0x0100;    // Reset the page address bit
   // Read the actual TWI address to decide what to do
   if(recAdd == (TWIadd+1))
@@ -182,7 +217,7 @@ void requestEvent(void)
     // True for second page in SEPROM emulation, set the address page bit
     Eaddress |= 0x0100;
   }
-  else if(recAdd == (TWIadd | 0x20))
+  else if(recAdd == cmd_add)
   {
     // True for general commands, process here
     requestEventProcessor();
@@ -270,6 +305,15 @@ bool ReadFloat(float *fval)
 void SendByte(byte bval)
 {
   sb.write(bval);
+}
+
+void SendWord(int ival)
+{
+  uint8_t *b;
+
+  b = (uint8_t *)&ival;
+  sb.write(b[0]);
+  sb.write(b[1]);
 }
 
 void SendInt24(int ival)
@@ -420,6 +464,24 @@ void receiveEventProcessor(int howMany)
           else UpdateCH2Drive(rfdriver.RFCD[Schan].DriveLevel);          
         }
         break;
+      case TWI_SET_PWL:
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLch = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLph = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLn = i;
+        if((i=ReadUnsignedWord()) == -1) break;
+        PWLvalue = i;
+        break;
+      case TWI_SET_PWL_N:
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLch = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLph = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        rfdriver.PWLcal[PWLch][PWLph].num = i;
+        break;
       case TWI_READ_AVALIBLE:
         // Set flag to return bytes avalible on the next read from TWI
         ReturnAvalible = true;
@@ -447,6 +509,22 @@ void receiveEventProcessor(int howMany)
         SendFloat(rfdriver.RFCD[Schan].RFnADCchan.m);
         SendFloat(rfdriver.RFCD[Schan].RFnADCchan.b);
         break;
+     case TWI_READ_PWL:
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLch = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLph = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLn = i;
+        SendWord(rfdriver.PWLcal[PWLch][PWLph].Value[PWLn]);
+        SendWord(rfdriver.PWLcal[PWLch][PWLph].ADCvalue[PWLn]);
+     case TWI_READ_PWL_N:
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLch = i & 1;
+        if((i=ReadUnsignedByte()) == -1) break;
+        PWLph = i & 1;
+        SendByte(rfdriver.PWLcal[PWLch][PWLph].num);
+        break;
      default:
         break;
     }
@@ -457,6 +535,11 @@ void receiveEventProcessor(int howMany)
 // this function is registered as an event, see setup()
 void receiveEvent(int howMany)
 {
+  int cmd_add;
+
+  if((TWIadd & 0x20) != 0) cmd_add =  TWIadd | 0x18;
+  else cmd_add = TWIadd | 0x20;
+
   if(howMany == 0) return;
   Eaddress = 0;
   // Read the actual TWI address to decide what to do
@@ -465,7 +548,7 @@ void receiveEvent(int howMany)
     // True for second page in SEPROM emulation, set the address page bit
     Eaddress |= 0x0100;
   }
-  else if(recAdd == (TWIadd | 0x20))
+  else if(recAdd == cmd_add)
   {
     // True for general commands, process here
     receiveEventProcessor(howMany);
@@ -521,14 +604,18 @@ void RFdriverAD5592init(int8_t addr)
 
 void setup() 
 {    
-  TWIadd = 0x50;
-  if(digitalRead(TWIADD1) == HIGH) TWIadd |= 0x02;
-  if(digitalRead(TWIADD2) == HIGH) TWIadd |= 0x04;
+  asm(".global _printf_float");
+  asm(".global _scanf_float");
+  delay(10);
   // Read the flash config contents into Ebuf and test the signature
   *fptr = flash_RFdriverData.read();
   if(fptr->Signature == SIGNATURE) rfdriver = *fptr;
   else rfdriver = RFDD_A_Rev_1;
   memcpy(Ebuf,(void *)&rfdriver,sizeof(RFdriverData));
+  // Set TWI base address
+  TWIadd = rfdriver.EEPROMadr;
+  if(digitalRead(TWIADD1) == HIGH) TWIadd |= 0x02;
+  if(digitalRead(TWIADD2) == HIGH) TWIadd |= 0x04;
   // Init serial communications
   SerialInit();
   // Init SPI
@@ -547,8 +634,11 @@ void setup()
   // Base address + 0x20 for the general command to this FAIMSFB module.
   // For example if base address is 0x50, then 0x51 is page 2 and 0x70 is
   // general commands.
+  // This module also supports extended addressing, so if the base address
+  // is 0x60 then the command address is 0x78
   PERIPH_WIRE.disableWIRE();
-  SERCOM3->I2CS.ADDR.reg |= SERCOM_I2CS_ADDR_ADDRMASK( 0x21ul );
+  if((TWIadd & 0x20) == 0) SERCOM3->I2CS.ADDR.reg |= SERCOM_I2CS_ADDR_ADDRMASK( 0x21ul );
+  else  SERCOM3->I2CS.ADDR.reg |= SERCOM_I2CS_ADDR_ADDRMASK( 0x19ul );
   PERIPH_WIRE.enableWIRE();
   // register events
   Wire.onReceive(receiveEvent);
@@ -729,6 +819,7 @@ void RFdriver_tune(void)
 float RFdriverCounts2Volts(int ADCcounts, ADCchan *adcchan)
 {
    float Pv;
+   int   i;
 
    if(rfdriver.Rev == 3)
    {
@@ -754,6 +845,15 @@ float RFdriverCounts2Volts(int ADCcounts, ADCchan *adcchan)
      Pv = Counts2Value(ADCcounts, adcchan);
      if(Pv < 0.0) Pv = 0.0;
    }  
+   else if(rfdriver.Rev == 5)
+   {
+     // Find the RF channel number and phase, then return the lookup value
+     for(int i=0; i<2; i++)
+     {
+       if(&rfdriver.RFCD[i].RFpADCchan == adcchan) return PWLlookup(i+1,0,ADCcounts);
+       if(&rfdriver.RFCD[i].RFnADCchan == adcchan) return PWLlookup(i+1,1,ADCcounts);
+     }
+   }
    return Pv; 
 }
 
@@ -811,7 +911,7 @@ void Update(void)
 }
 
 // This function process all the serial IO and commands
-void ProcessSerial(bool scan = true)
+void ProcessSerial(bool scan)
 {
   // Put serial received characters in the input ring buffer
   if (Serial.available() > 0)
@@ -825,7 +925,7 @@ void ProcessSerial(bool scan = true)
 
 // Adjust the gain for the selected channel to calibrate the readback to match
 // the passed parameter, vpp. If vpp is negative then the gain is set to default
-// value. Channel numbe ch is 0 or 1.
+// value. Channel number ch is 0 or 1.
 void RFcalP(int ch, float vpp)
 {
   int brd,ADCraw;
@@ -874,7 +974,6 @@ void RFcalN(int ch, float vpp)
   }
 }
 
-
 void loop() 
 {
   ProcessSerial();
@@ -891,6 +990,15 @@ void loop()
     Ncal = false;
   }
   // Process gate request
+
+  // Process PWL table read request
+  if(PWLvalue != -1)
+  {
+    if(PWLph == 0) rfdriver.PWLcal[PWLch][0].ADCvalue[PWLn] = AD5592readADC(AD5592_CS, rfdriver.RFCD[PWLch].RFpADCchan.Chan, 100);
+    if(PWLph == 1) rfdriver.PWLcal[PWLch][1].ADCvalue[PWLn] = AD5592readADC(AD5592_CS, rfdriver.RFCD[PWLch].RFnADCchan.Chan, 100);
+    rfdriver.PWLcal[PWLch][PWLph].Value[PWLn] = PWLvalue;
+    PWLvalue = -1;
+  }
 }
 
 //
@@ -911,7 +1019,7 @@ void RestoreSettings(void)
   if(fptr->Signature == SIGNATURE) rfdriver = *fptr;
   else
   {
-    // copy faimsfb to Ebuf if restore failed
+    // copy rfdriver to Ebuf if restore failed
     *fptr = rfdriver;
     SetErrorCode(ERR_EEPROMWRITE);
     SendNAK;
@@ -929,6 +1037,325 @@ void FormatFLASH(void)
 {
   flash_RFdriverData.write(RFDD_A_Rev_1);  
   SendACK;
+}
+
+// Tests the channel number if invalid its NAKed and false is returned.
+bool IsChannelValid(int channel, bool Response = true)
+{
+  if ((channel >= 1) && (channel <= 2)) return true;
+  if(!Response) return false;
+  SetErrorCode(ERR_BADARG);
+  SendNAK;
+  return false;
+}
+
+// Set a channels freqency
+void RFfreq(int channel, int freq)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // If freq value is invalid send NAK and exit
+  if ((freq < MinFreq) || (freq > MaxFreq)) BADARG;
+  // If here ACK the command and set the frequency
+  SendACK;
+  rfdriver.RFCD[channel-1].Freq = freq;
+}
+
+void RFvoltage(char *Chan, char *Val)
+{
+  int   channel;
+  float Voltage;
+
+  sscanf(Chan, "%d", &channel);
+  sscanf(Val, "%f", &Voltage);
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // If Drive value is invalid send NAK and exit
+  if ((Voltage < 0) || (Voltage > 4000.0)) BADARG;
+  // If here ACK the command and set the drive level
+  SendACK;
+  rfdriver.RFCD[channel-1].Setpoint = Voltage;
+}
+
+void RFdrive(char *Chan, char *Val)
+{
+  int   channel;
+  float Drive;
+
+  sscanf(Chan, "%d", &channel);
+  sscanf(Val, "%f", &Drive);
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // If Drive value is invalid send NAK and exit
+  if ((Drive < 0) || (Drive > rfdriver.RFCD[channel - 1].MaxDrive)) BADARG;
+  // If here ACK the command and set the drive level
+  SendACK;
+  rfdriver.RFCD[channel - 1].DriveLevel = Drive;
+}
+
+void RFfreqReport(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // Report the channels frequency
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.RFCD[channel - 1].Freq);
+}
+
+void RFvoltageReportP(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rb[channel-1].RFP);
+}
+
+void RFvoltageReportN(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rb[channel-1].RFN);
+}
+
+void RFdriveReport(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.RFCD[channel - 1].DriveLevel);
+}
+
+// Reports the voltage setpoint
+void RFvoltageReport(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.RFCD[channel - 1].Setpoint);
+}
+
+void RFheadPower(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rb[channel-1].PWR);
+}
+
+void RFmodeReport(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // report the mode
+  SendACKonly;
+  if(SerialMute) return;
+  if(rfdriver.RFCD[channel - 1].RFmode == RF_MANUAL) serial->println("MANUAL");
+  else serial->println("AUTO");
+}
+
+void RFmodeSet(char *chan, char *mode)
+{
+  int    channel;
+  String sToken;
+
+  sToken = chan;
+  channel = sToken.toInt();
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  sToken = mode;
+  if((sToken != "AUTO") && (sToken != "MANUAL")) BADARG;
+  SendACK;
+  if(sToken == "MANUAL") rfdriver.RFCD[channel - 1].RFmode = RF_MANUAL;
+  else 
+  {
+    rfdriver.RFCD[channel - 1].Setpoint = (rb[channel - 1].RFP + rb[channel - 1].RFN) / 2;
+    rfdriver.RFCD[channel - 1].RFmode = RF_AUTO;
+  }
+}
+
+void RFreportAll(void)
+{
+  int  i;
+
+  if (SerialMute) return;
+  SendACKonly;
+  for(i=1;i<=2;i++)
+  {
+    if (!IsChannelValid(i,false)) break;
+    if(i > 1) serial->print(",");
+    serial->print(rfdriver.RFCD[i - 1].Freq);
+    serial->print(",");
+    serial->print(rfdriver.RFCD[i - 1].DriveLevel);
+    serial->print(",");
+    serial->print(rb[i - 1].RFP);
+    serial->print(",");
+    serial->print(rb[i - 1].RFN);
+  }
+  serial->println("");
+}
+
+void RFautoTune(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // Exit if we are already tuning
+  if(Tuning) ERR(ERR_TUNEINPROCESS);
+  // Exit if not in manual mode for this channel
+  if(rfdriver.RFCD[channel - 1].RFmode != RF_MANUAL) ERR(ERR_NOTINMANMODE);
+  // Set the tune flag and exit
+  SendACK;
+  TuneRFChan = channel - 1;
+  TuneRequest = true;
+  TuneReport = true;   // Causes the auto tune algorithm to send report
+}
+
+void RFautoRetune(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  // Exit if we are already tuning
+  if(Tuning) ERR(ERR_TUNEINPROCESS);
+  // Exit if not in manual mode for this channel
+  if(rfdriver.RFCD[channel - 1].RFmode != RF_MANUAL) ERR(ERR_NOTINMANMODE);
+  // Set the tune flag and exit
+  SendACK;
+  TuneRFChan = channel - 1;
+  RetuneRequest = true;
+  TuneReport = true;   // Causes the auto tune algorithm to send report
+}
+
+// Sets the defined channels calibration parameters to the values passed. The 
+// parameters are in the ring buffer when this function is called.
+// channel,slope, intercept
+// This function sets the pos and neg monitor calibration to the same values.
+void RFcalParms(void)
+{
+   char   *Token;
+   String sToken;
+   int    ch;
+   float  m,b;
+
+   while(1)
+   {
+     // Read all the arguments
+     GetToken(true);
+     if((Token = GetToken(true)) == NULL) break;
+     sToken = Token;
+     ch = sToken.toInt();
+     GetToken(true);
+     if((Token = GetToken(true)) == NULL) break;
+     sToken = Token;
+     m = sToken.toFloat();
+     GetToken(true);
+     if((Token = GetToken(true)) == NULL) break;
+     sToken = Token;
+     b = sToken.toFloat();
+     if((Token = GetToken(true)) == NULL) break;
+     if(Token[0] != '\n') break;
+     // Test the channel and exit if error
+     if (!IsChannelValid(ch,false)) break;
+     rfdriver.RFCD[ch-1].RFpADCchan.m = m;
+     rfdriver.RFCD[ch-1].RFpADCchan.b = b;
+     rfdriver.RFCD[ch-1].RFnADCchan.m = m;
+     rfdriver.RFCD[ch-1].RFnADCchan.b = b;  
+     SendACK;
+     return;
+   }
+   // If here then we had bad arguments!
+  SetErrorCode(ERR_BADARG);
+  SendNAK;
+}
+
+// Software calibration functions to make minor adjustment to the RF level readback detectors. 
+// These routines interate to converge on the desired output. To use this feature you need
+// to set the RF level and read its level then calibrate the channel by defining the desired
+// readback level.
+void RFcalP(char *channel, char *Vpp)
+{
+  String sToken;
+  int ch;
+  float vpp;
+
+  sToken = channel;
+  ch = sToken.toInt();
+  sToken = Vpp;
+  vpp = sToken.toFloat();
+  if (!IsChannelValid(ch,false)) return;
+  // Signal processing loop to perform the calibration gain adjustment
+  vcal = vpp;
+  ccal = ch-1;
+  Pcal = true;
+  SendACK;
+}
+
+void RFcalN(char *channel, char *Vpp)
+{
+  String sToken;
+  int ch;
+  float vpp;
+
+  sToken = channel;
+  ch = sToken.toInt();
+  sToken = Vpp;
+  vpp = sToken.toFloat();
+  if (!IsChannelValid(ch,false)) return;
+  // Signal processing loop to perform the calibration gain adjustment
+  vcal = vpp;
+  ccal = ch-1;
+  Ncal = true;
+  SendACK;
+}
+
+void GetRFpwrLimit(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.PowerLimit);
+}
+
+void SetRFpwrLimit(int channel, int Power)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  if((Power < 1) || (Power > 100)) BADARG;
+  SendACK;
+  rfdriver.PowerLimit = Power;
+}
+
+void setMaxDrive(int channel, int Drive)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  if((Drive < 1) || (Drive > 100)) BADARG;
+  SendACK;
+  rfdriver.RFCD[channel-1].MaxDrive = Drive;
+}
+
+void getMaxDrive(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.RFCD[channel-1].MaxDrive);
+}
+
+void setMaxPower(int channel, int Power)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  if((Power < 1) || (Power > 100)) BADARG;
+  SendACK;
+  rfdriver.RFCD[channel-1].MaxPower = Power;
+}
+
+void getMaxPower(int channel)
+{
+  // If channel is invalid send NAK and exit
+  if (!IsChannelValid(channel)) return;
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.RFCD[channel-1].MaxPower);
 }
 
 void ReportRFchan1(void)
@@ -971,4 +1398,113 @@ void ReportRFlevelADC(int8_t chan)
 
 void Debug(int i)
 {
+}
+
+void genPWLcalTable(char *channel, char *phase)
+{
+  String sToken;
+  char   *res;
+  int    ph,i;
+  float  Drive;
+  
+  sToken = channel;
+  PWLch = sToken.toInt();
+  if (!IsChannelValid(PWLch,false)) return;
+  sToken = phase;
+  if((sToken != "RF+") && (sToken != "RF-")) BADARG;
+  if(sToken == "RF+") ph = 0;
+  else ph = 1;
+  // Send the user instructions.
+  serial->println("This function will generate a piecewise linear");
+  serial->println("calibration table. Set the drive level to reach");
+  serial->println("desired calibration points and then enter the");
+  serial->println("measured value to the nearest volt. Press enter");
+  serial->println("When finished. Voltage must be increasing!");
+  // Loop to allow user to adjust drive and enter measured voltage
+  rfdriver.PWLcal[PWLch - 1][ph].num = 0;
+  i=0;
+  Drive = rfdriver.RFCD[PWLch - 1].DriveLevel;
+  while(true)
+  {
+     serial->print("\nPoint ");
+     serial->println(i+1);
+     res = UserInput("Enter drive level: ", loop);
+     sToken = res;
+     rfdriver.RFCD[PWLch - 1].DriveLevel = sToken.toFloat();
+     if(rfdriver.RFCD[PWLch - 1].DriveLevel > 100) rfdriver.RFCD[PWLch - 1].DriveLevel = 100;
+     if(rfdriver.RFCD[PWLch - 1].DriveLevel < 0) rfdriver.RFCD[PWLch - 1].DriveLevel = 0;
+     res = UserInput("Enter measured voltage: ", loop);
+     if(res == NULL) break;
+     sToken = res;
+     rfdriver.PWLcal[PWLch - 1][ph].Value[i] = sToken.toInt();
+     // Read the ADC raw counts
+     if(ph == 0) rfdriver.PWLcal[PWLch - 1][ph].ADCvalue[i] = AD5592readADC(rfdriver.ADCadr, rfdriver.RFCD[PWLch - 1].RFpADCchan.Chan, 100);
+     else rfdriver.PWLcal[PWLch - 1][ph].ADCvalue[i] = AD5592readADC(rfdriver.ADCadr, rfdriver.RFCD[PWLch - 1].RFpADCchan.Chan, 100);
+     i++;
+     rfdriver.PWLcal[PWLch - 1][ph].num = i;
+     if(i>=MAXPWL) break;
+  }
+  serial->println("");
+  // Report the table
+  serial->print("Number of table entries: ");
+  serial->println(rfdriver.PWLcal[PWLch - 1][ph].num);
+  for(i=0;i<rfdriver.PWLcal[PWLch - 1][ph].num;i++)
+  {
+    serial->print(rfdriver.PWLcal[PWLch - 1][ph].Value[i]);
+    serial->print(",");
+    serial->println(rfdriver.PWLcal[PWLch - 1][ph].ADCvalue[i]);
+  }
+  // Done!
+  serial->println("\nData entry complete!");
+  rfdriver.RFCD[PWLch - 1].DriveLevel = Drive;
+}
+
+// This function will use the selected piecewise linear table to convert the 
+// adcval to output voltage.
+// ch = Rf channel 1 through maximum RF channels
+// ph = phase, 0 = RF+, 1 = RF-
+float PWLlookup(int ch, int ph, int adcval)
+{
+  int            brd,i;
+  PWLcalibration *pwl;
+  
+  pwl = &rfdriver.PWLcal[ch - 1][ph];
+  if(pwl->num < 2) return 0;
+  for(i=0;i<pwl->num-1;i++)
+  {
+    if(adcval < pwl->ADCvalue[i]) break;
+    if((adcval >= pwl->ADCvalue[i]) && (adcval <= pwl->ADCvalue[i+1])) break;
+  }
+  if(i == pwl->num-1) i--;
+  // The points at i and i+1 will be used to calculate the output voltage
+  // y = y1 + (x-x1) * (y2-y1)/(x2-x1)
+  return (float)pwl->Value[i] + ((float)adcval - (float)pwl->ADCvalue[i]) * ((float)pwl->Value[i+1]-(float)pwl->Value[i])/((float)pwl->ADCvalue[i+1] -(float)pwl->ADCvalue[i]);
+}
+
+void SetTWIbaseAdd(char *add)
+{
+  int i;
+  
+  sscanf(add,"%x",&i);
+  rfdriver.EEPROMadr = i;
+  SendACK;
+}
+
+void GetTWIbaseAdd(void)
+{
+  SendACKonly;
+  serial->println(rfdriver.EEPROMadr,HEX);
+}
+
+void getRev(void)
+{
+  SendACKonly;
+  if (!SerialMute) serial->println(rfdriver.Rev);
+}
+
+void setRev(int rev)
+{
+   if((rev < 1) || (rev >10)) BADARG;
+   SendACK;
+   rfdriver.Rev = rev;
 }

@@ -17,6 +17,9 @@ extern int ErrorCode;
 
 #define SetErrorCode(x) ErrorCode=x
 
+#define ERR(err)  { SetErrorCode(err); SendNAK; return;}
+#define BADARG  { SetErrorCode(ERR_BADARG); SendNAK; return;}
+
 // List of error codes and there descriptions
 
 // This group of error codes are sharded between MIPS and AMPS. MIPS
