@@ -42,6 +42,12 @@ include/              Headers for the above, plus shared MIPS ecosystem
                        utility headers (AtomicBlock.h)
 lib/Wire/             Project-local override of the framework's Wire
                        library - see "Notes on this PlatformIO port" below
+firmware/             Published build images, one per version, usable for a
+                       PGM update or a bossac recovery flash
+pgm_update.py         Host-side tool that performs a PGM firmware update,
+                       over USB or through a MIPS TWITALK relay - see
+                       "Running an update" below
+publish_firmware.py   Post-build step that populates firmware/
 platformio.ini        Build configuration
 ```
 
@@ -234,10 +240,68 @@ known to work from a bootloader state:
     -e -w -v -R -o 0x2000 .pio/build/adafruit_feather_m0/firmware.bin
 ```
 
-[pgm_update.py](pgm_update.py) is the host-side tool to drive `PGM` with (a
-plain terminal can't type the hex-encoded image body); it also carries the
-diagnostic flags used to characterise this failure.
-
 Every `pio run` automatically publishes the build to
 [firmware/](firmware/) as `RFdriver_v<version>.bin`, ready to hand to `PGM`
 or use as a recovery image - see [firmware/README.md](firmware/README.md).
+
+### Running an update: `pgm_update.py`
+
+[pgm_update.py](pgm_update.py) drives the whole `PGM` protocol from the host.
+You need it - a plain terminal can't type the hex-encoded image body. It needs
+pyserial (`pip install pyserial`), and `--help` lists every option.
+
+**Two transports.** Point `--port` at whichever device the host is plugged
+into:
+
+- **Direct USB** - `--port` is the *module's own* USB port. Use this on the
+  bench.
+- **Through MIPS** - `--port` is the *MIPS controller's* port, plus
+  `--twi <board>,<address>` (add `--wire1` if the module is on the `Wire1`
+  bus). The tool opens a `TWITALK` tunnel, runs the update through it, and
+  always closes it with ESC afterwards. This needs no physical access to the
+  module.
+
+**Check what you're talking to first.** This is read-only and is the fastest
+way to confirm a port, a board number and a TWI address before risking
+anything:
+
+```sh
+python3 pgm_update.py --port /dev/cu.usbmodemXXXX --check-only
+python3 pgm_update.py --port /dev/cu.usbmodemXXXX --twi 0,112 --check-only
+```
+
+**Do an update:**
+
+```sh
+# on the bench, over the module's own USB
+python3 pgm_update.py --port /dev/cu.usbmodemXXXX \
+    --file firmware/RFdriver_v1.5.bin --expect-version "1.5"
+
+# installed in a MIPS system, through the controller - takes ~3 minutes
+python3 pgm_update.py --port /dev/cu.usbmodemMIPS \
+    --twi 0,112 --file firmware/RFdriver_v1.5.bin
+```
+
+It prompts before starting; `-y` skips the prompt and `-q` suppresses the
+per-row progress lines. `--expect-version` reconnects after the reset and
+checks `GVER` - it is skipped in `--twi` mode, because the module resets out
+of relay mode, so verify that case with a second `--twi ... --check-only`.
+
+**Fault-injection flags**, for re-running the checklist.md §10 rejection
+tests. Each of these should be *rejected* with the module still running:
+
+| Flag | Simulates |
+|---|---|
+| `--crc N` | a corrupted CRC line (pass a wrong value) |
+| `--flip-byte OFFSET` | a corrupted image byte (repeatable) |
+| `--truncate N` | a connection dropped mid-transfer |
+| `--size N` | a size that disagrees with the data sent |
+| `--pause-before-row ROW:SECONDS` | a stall before a given row (timing diagnostics) |
+
+Pointing `--file` at any non-image file (e.g. `README.md`) exercises the
+vector-table sanity check.
+
+**If an update fails**, that is the designed behaviour and costs nothing: the
+application partition is only ever written during the final copy, so a
+rejected or interrupted transfer leaves the old firmware running. Re-run it.
+Only a failure *during* the final copy needs the bossac recovery above.
