@@ -51,16 +51,40 @@ void  UpdateCH2Drive(float drive);
 
 // Firmware field-update over the USB serial command line - see
 // ProgramFLASHcmd() in Hardware.cpp for the full protocol and safety design.
-// APP_FLASH_START is the first byte of application flash, right after the
-// 8KB UF2 bootloader reserved by this board's linker script
-// (variants/feather_m0/linker_scripts/gcc/flash_with_bootloader.ld); code
-// below that address is never touched. APP_FLASH_END is one past the last
-// byte of flash on the SAMD21G18A. FLASH_ROW_SIZE is this chip's NVM erase
-// granularity (4 x 64-byte pages) and matches the block size the update
-// protocol already uses.
-#define APP_FLASH_START  0x00002000UL
-#define APP_FLASH_END    0x00040000UL
-#define FLASH_ROW_SIZE   256
+//
+// The 256KB flash on the SAMD21G18A is partitioned three ways:
+//
+//   0x00000000  bootloader   8KB   SAM-BA, reserved by this board's linker
+//                                  script (variants/feather_m0/linker_scripts/
+//                                  gcc/flash_with_bootloader.ld). Never
+//                                  touched by anything here - it is the
+//                                  recovery path.
+//   0x00002000  application  124KB the running firmware. Only ever written by
+//                                  the RAM-resident copier at the very end of
+//                                  an update.
+//   0x00021000  staging      124KB where an incoming update is received and
+//                                  verified. Holds no executing code, so it
+//                                  is safe to erase and write while the
+//                                  firmware runs normally.
+//
+// The split exists because this chip has a single flash bank: erasing a row
+// that holds executing code hard-hangs the CPU (it fetches erased 0xFF as an
+// instruction). Streaming an update directly over the running application is
+// therefore impossible - that was the Rev 1.4 bug. Staging first means the
+// only moment the application is overwritten is inside a RAM-resident routine
+// that calls nothing in flash.
+//
+// FLASH_ROW_SIZE is this chip's NVM erase granularity (4 x 64-byte pages) and
+// matches the block size the update protocol already uses.
+#define APP_FLASH_START    0x00002000UL
+#define APP_FLASH_END      0x00021000UL
+#define STAGE_FLASH_START  0x00021000UL
+#define STAGE_FLASH_END    0x00040000UL
+#define FLASH_ROW_SIZE     256
+
+// Largest image an update can carry: it has to fit in the application
+// partition and in staging, which are deliberately the same size (124KB).
+#define APP_MAX_SIZE     (APP_FLASH_END - APP_FLASH_START)
 
 void  ProgramFLASHcmd(char *sizeStr);
 

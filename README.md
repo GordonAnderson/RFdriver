@@ -106,44 +106,137 @@ build; they exist purely to make that same firmware build under PlatformIO.
 
 ## Firmware field update (`PGM` command)
 
-`PGM` (`ProgramFLASHcmd()` in [src/Hardware.cpp](src/Hardware.cpp)) lets a
-USB-connected host replace this module's own firmware without a debugger,
-reusing the same hex-encoded, CRC-checked transfer protocol the MIPS host
-tooling already speaks to other modules (`Comms::ARBupload()` in the MIPS
-host app): send `PGM,<size>` (image size in bytes, decimal), then the image
-as ASCII hex (two characters per byte), then a newline and the image's 8-bit
-CRC (poly 0x1D) in decimal.
+`PGM` (`ProgramFLASHcmd()` in [src/Hardware.cpp](src/Hardware.cpp)) replaces
+this module's own firmware without a debugger - either from a host on the
+module's own USB port, or from a MIPS controller relaying over TWI
+(`TWITALK`), which needs no physical access to the module at all. It reuses
+the same hex-encoded, CRC-checked transfer protocol the MIPS host tooling
+already speaks to other modules (`Comms::ARBupload()` in the MIPS host app):
+send `PGM,<size>` (image size in bytes, decimal), then the image as ASCII hex
+(two characters per byte), then a newline and the image's 8-bit CRC (poly
+0x1D) in decimal. Drive it with [pgm_update.py](pgm_update.py).
 
-This board has one flash bank, so the update writes over the running
-application in place - see the detailed safety design and its limits in the
-comment above `ProgramFLASHcmd()`. The short version:
+> **Working as of Rev 1.5** (September 8, 2026), verified on hardware both
+> over direct USB and through the MIPS TWI relay - which is the point of the
+> feature: a module's firmware can be updated without opening the enclosure.
+> Direct USB: full 77984-byte round trip in ~13 s, a real v1.5 -> v1.4 version
+> change, and clean rejection of bad-CRC / non-image / dropped-transfer cases
+> with the board still running. Through `TWITALK`: same image in 162 s, plus a
+> rejected transfer that left the module running. See
+> [checklist.md](checklist.md) §10 and §11.
+>
+> **Rev 1.4's `PGM` was broken** - it hard-hung the board on every update and
+> needed physical bootloader recovery. Do not field 1.4. The postmortem below
+> explains why, because the failure mode is easy to reintroduce.
 
-- The image is validated (size bounds, a plausible vector table) before
-  anything is written, and every row is read back and verified against what
-  was sent.
-- The vector table (the image's first 256 bytes) is deliberately held back
-  in RAM and committed - by a small, separately-verified, RAM-resident
-  routine - only after the *entire rest* of the image has been written and
-  its whole-image CRC has checked out. That commit is immediately followed
-  by a reset into the new firmware and never returns.
-- Consequently, any failure detected along the way (bad CRC, a verify
-  mismatch, a timeout, an implausible image) leaves the *old* firmware's
-  vector table untouched and the board keeps running normally - no recovery
-  needed for the common failure modes.
-- What it does not protect against: a failure (power loss, a dropped USB
-  connection) in the middle of writing one of the other rows can still leave
-  the running application internally inconsistent. Recovery from that is the
-  same physical bootloader recovery this board already needs for its initial
-  programming: open the enclosure, double-tap reset to force it into its
-  SAM-BA bootloader (it reappears as a serial port - this board's bootloader
-  is the classic Arduino/`bossac` one, not the UF2/drag-and-drop kind some
-  other Adafruit SAMD boards use), then reflash a known-good build with
-  `pio run -t upload` or `bossac` directly. Nothing `PGM` does can affect
-  that recovery path, since it never touches flash below the application's
-  own start address.
+### Why the Rev 1.4 design failed
 
-This has been reviewed carefully and checked at the disassembly level, but
-has not yet been exercised on real hardware - see [checklist.md](checklist.md).
+This board has one flash bank, so the update as originally written overwrote
+the running application in place. That is the fatal flaw: **it erased the
+code it was currently executing.**
+
+`ProgramFLASHcmd()` links at `0x292C-0x2CDB` (flash rows 9-12), and its
+erase/write sequence sits at `0x2ad0-0x2ae8`, inside row 10. When the update
+reaches row 10:
+
+1. `noInterrupts()` disables interrupts.
+2. `FlashClass::erase()` wipes row 10 to `0xFF`.
+3. `erase()` returns to `0x2ae0` - *an address inside the row it just
+   erased*.
+4. The CPU fetches `0xFFFF`, an undefined Thumb encoding, and HardFaults with
+   interrupts off - before ever reaching the `write()` at `0x2ae8` that would
+   have restored those bytes.
+
+The board hangs until a physical reset. This is deterministic and reproduces
+on every attempt, independent of image content, transfer length, or transfer
+speed.
+
+Rows 0-9 survive only by luck of code layout: while they are being erased,
+the erase/write window itself (row 10) is still intact, and each row is
+restored to identical content before anything in it is needed again. Row 10
+is simply the first row that contains the critical window. At least 15
+distinct rows hold code the update loop executes - `ProcessSerial`, `RB_Get`,
+`GetToken`, `FlashClass`, `Print::println`, `millis`, `memcpy`, `siscanf`,
+plus the whole USB/CDC stack - so dodging row 10 alone would not help.
+
+The design comment above `ProgramFLASHcmd()` states the governing rule
+correctly - *nothing in flash can be safely called into once we've started
+rewriting it* - but applies it only to the row-0 commit, when it applies to
+every row.
+
+What did work, and is worth keeping: the RAM-resident
+`IAP_CommitRow0AndReset()` was exercised successfully on real hardware (a
+10-row transfer that stops short of row 10 completes, commits, resets, and
+reboots cleanly). The RAM-resident commit technique is validated; it is the
+in-place *streaming* write that is unworkable.
+
+### The Rev 1.5 design - stage in spare flash, then RAM-resident copy
+
+Writing to flash that holds no executing code is safe - that is exactly why
+rows 0-9 worked. So flash is now partitioned (see
+[include/Hardware.h](include/Hardware.h)):
+
+| Region | Range | Size | Notes |
+|---|---|---|---|
+| Bootloader | `0x00000` - `0x02000` | 8KB | SAM-BA. Never touched; it is the recovery path. |
+| Application | `0x02000` - `0x21000` | 124KB | The running firmware. Only ever written by the RAM-resident copier. |
+| Staging | `0x21000` - `0x40000` | 124KB | Where an update is received and verified. Holds no code. |
+
+1. The incoming image is streamed into **staging**. Serial, USB, CRC and the
+   command loop all keep running from flash, because nothing being erased is
+   ever executing. Each row is read back and verified as it lands.
+2. The whole staged image is then re-read from flash and CRC'd again, which
+   catches a row that verified but landed in the wrong place.
+3. Only then does `IAP_CopyStagingToAppAndReset()` - RAM-resident, calling
+   nothing in flash - copy staging over the application row by row and reset.
+
+Any failure before step 3 (bad CRC, verify mismatch, timeout, implausible
+image, dropped connection) leaves the application partition completely
+untouched and the board running normally. That is the property Rev 1.4
+claimed and did not have; it is now tested rather than argued.
+
+The window in which a power loss is unrecoverable shrinks from the whole
+multi-minute transfer to the few hundred milliseconds of flash-to-flash copy.
+
+Two constraints this creates, both enforced or documented rather than left to
+memory:
+
+- **The build must fit the application partition**, not merely the chip.
+  [publish_firmware.py](publish_firmware.py) fails the build if it doesn't.
+  Staging must stay at least as large as the application partition.
+- **`IAP_CopyStagingToAppAndReset()` must never call into flash.** After
+  changing it, confirm with `arm-none-eabi-nm` that it still links at a
+  `0x20xxxxxx` (RAM) address, and with `arm-none-eabi-objdump -D` that its
+  disassembly contains no `bl` to a `0x0000xxxx` address. The `volatile`
+  pointers in its copy loop are load-bearing: without them GCC emits a call
+  to `memcpy`, which lives in flash, and the update would fault.
+
+A `PGM` update resets saved settings, exactly as a `bossac` reflash does -
+the `FlashStorage` backing store is linked into the image itself.
+
+Recovery, in the meantime and after any failed update, is the physical
+bootloader path this board already needs for initial programming: open the
+enclosure, double-tap reset to force it into its SAM-BA bootloader (it
+reappears as a serial port - this board's bootloader is the classic
+Arduino/`bossac` one, not the UF2/drag-and-drop kind some other Adafruit SAMD
+boards use), then reflash a known-good build. Nothing `PGM` does can affect
+that recovery path, since it never touches flash below the application's own
+start address.
+
+`pio run -t upload` is *not* the tool to recover with: it does a 1200-baud
+touch-reset that assumes the application is still running, so it fails
+outright from an already-bootloader state (and was also seen to fail
+mid-write once). Drive `bossac` directly instead - this exact invocation is
+known to work from a bootloader state:
+
+```
+~/.platformio/packages/tool-bossac/bossac --port=cu.usbmodemXXXX \
+    -e -w -v -R -o 0x2000 .pio/build/adafruit_feather_m0/firmware.bin
+```
+
+[pgm_update.py](pgm_update.py) is the host-side tool to drive `PGM` with (a
+plain terminal can't type the hex-encoded image body); it also carries the
+diagnostic flags used to characterise this failure.
 
 Every `pio run` automatically publishes the build to
 [firmware/](firmware/) as `RFdriver_v<version>.bin`, ready to hand to `PGM`

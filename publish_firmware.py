@@ -22,6 +22,12 @@ SRC_FILE = os.path.join(PROJECT_DIR, "src", "RFdriver.cpp")
 FIRMWARE_DIR = os.path.join(PROJECT_DIR, "firmware")
 README_FILE = os.path.join(FIRMWARE_DIR, "README.md")
 
+# Application partition size - must track APP_FLASH_START/APP_FLASH_END in
+# include/Hardware.h. A build larger than this cannot be installed by PGM.
+APP_FLASH_START = 0x00002000
+APP_FLASH_END = 0x00021000
+APP_MAX_SIZE = APP_FLASH_END - APP_FLASH_START
+
 VERSION_RE = re.compile(r'Version\[\]\s*PROGMEM\s*=\s*"RFdriver version ([^"]+)"')
 TABLE_ROW_RE = r'\| `{filename}` \|.*\|\n'
 TABLE_HEADER_RE = re.compile(r'(\|---\|---\|---\|---\|---\|\n)')
@@ -80,6 +86,18 @@ def publish_firmware(source, target, env):
     built_bin = str(target[0])
     with open(built_bin, "rb") as f:
         data = f.read()
+
+    # The PGM field update copies a staged image over the application
+    # partition, so the build has to fit in that partition - not merely in the
+    # chip. These must track APP_FLASH_START/APP_FLASH_END in include/Hardware.h.
+    if len(data) > APP_MAX_SIZE:
+        raise Exception(
+            "firmware publish: build is {} bytes, which does not fit the {}-byte "
+            "application partition (APP_FLASH_START..APP_FLASH_END in "
+            "include/Hardware.h). PGM could not install this image. Either shrink "
+            "the build or re-partition - note the staging region must stay at "
+            "least as large as the application region.".format(len(data), APP_MAX_SIZE)
+        )
 
     os.makedirs(FIRMWARE_DIR, exist_ok=True)
     filename = "RFdriver_v{}.bin".format(short_version)

@@ -68,6 +68,40 @@
 //    7.) Bumped the Version string below to 1.4 to match this entry (it had been left
 //        at "1.3, August 13, 2023" through all of the above). Built images now live in
 //        firmware/, named to match this version - see firmware/README.md.
+//  Rev 1.5, September 8, 2026
+//    1.) Fixed PGM, which was completely broken in 1.4: it hard-hung the board on
+//        every real update and required physical bootloader recovery. 1.4 streamed the
+//        incoming image straight over the running application, one row at a time. This
+//        chip has a single flash bank and no read-while-write, so erasing a row that
+//        holds executing code is fatal - the CPU fetches the erased 0xFF back as an
+//        instruction and faults. It always died at flash row 10 (0x2A00), because
+//        ProgramFLASHcmd() itself links at 0x292C-0x2CDB and its erase/write sequence
+//        sits at 0x2ad0-0x2ae8, inside that row: FlashClass::erase() wiped the row and
+//        then returned into it. Rows 0-9 survived only by luck of layout. Confirmed on
+//        hardware four times, independent of image content, transfer length and
+//        transfer speed. 1.4's design comment stated the governing rule correctly -
+//        nothing in flash can be safely called into once we've started rewriting it -
+//        but applied it only to the row-0 commit, when it applies to every row.
+//    2.) Reworked PGM to stage and then commit. Flash is now partitioned into an
+//        application region (0x2000-0x21000) and a same-sized staging region
+//        (0x21000-0x40000), see Hardware.h. The incoming image is received into
+//        staging, which holds no executing code and is therefore safe to write while
+//        the firmware runs normally; each row is read back and verified as it lands,
+//        and the whole staged image is re-read and CRC'd again. Only then does the
+//        RAM-resident IAP_CopyStagingToAppAndReset() copy staging over the application
+//        and reset. Any failure before that leaves the application untouched and the
+//        board running - the property 1.4 claimed but did not have.
+//    3.) IAP_CommitRow0AndReset() (1.4's RAM-resident row-0 committer, which was
+//        itself correct and was confirmed working on hardware) is replaced by
+//        IAP_CopyStagingToAppAndReset(), which applies the same technique to the whole
+//        image rather than just the vector table.
+//    4.) PGM now sends "Next" after the first row too. 1.4 held row 0 back and stayed
+//        silent for it, which did not match Comms::ARBupload() in the MIPS host app -
+//        ARBupload waits for a line after every full block including the first, so it
+//        would have timed out on the very first block. The protocols now agree.
+//    5.) Added pgm_update.py at the project root: the host-side tool for driving PGM
+//        over direct USB (and, later, through the MIPS TWITALK relay). A plain
+//        terminal cannot type the hex-encoded image body.
 //
 #include <Arduino.h>
 #include <variant.h>
@@ -93,7 +127,7 @@
 SoftwareI2C WireS1;
 
 int8_t        TWIadd = 0x50;
-const char    Version[] PROGMEM = "RFdriver version 1.4, September 7, 2026";
+const char    Version[] PROGMEM = "RFdriver version 1.5, September 8, 2026";
 RFdriverData  rfdriver;
 RFDRVstate    sdata[2];
 int           recAdd;    

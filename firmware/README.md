@@ -15,6 +15,7 @@ number defeats the point of naming the file after one.
 
 | File | Version | Size (bytes) | CRC-8 (poly 0x1D) | SHA-256 |
 |---|---|---|---|---|
+| `RFdriver_v1.5.bin` | 1.5, September 8, 2026 | 77984 | 106 | `fb0f7bfff9e25c14dcce35f1d1eaf47279574d2548fbaf7174b225506717d49c` |
 | `RFdriver_v1.4.bin` | 1.4, September 7, 2026 | 77952 | 112 | `fe876840f1d0cee621ddb863e7318fd2381c0a05c12be45d6fb9b007d5b16a96` |
 
 Size and CRC-8 are exactly the two values the `PGM` command's transfer

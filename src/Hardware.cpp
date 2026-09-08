@@ -391,80 +391,139 @@ static bool IsPlausibleVectorTable(const uint8_t *row0)
   return true;
 }
 
-// Writes the already-verified vector table row to APP_FLASH_START and
-// immediately resets the CPU into the new firmware - this function never
-// returns. See ProgramFLASHcmd() below for why this specific step, and only
-// this step, has to work this way.
+// Scratch row buffer for IAP_CopyStagingToAppAndReset() below. It has to live
+// in RAM (it does - .bss), be 4-byte aligned for the word accesses, and be a
+// file-scope object rather than a local, so the copier never touches the
+// stack-heavy paths or anything else that might drag in a flash-resident
+// helper.
+static uint8_t IAProwBuf[FLASH_ROW_SIZE] __attribute__((aligned(4)));
+
+// Copies the verified image from the staging partition over the application
+// partition, row by row, then resets into it. This function never returns.
 //
-// By the time this runs, the rest of the new image is already written and
-// CRC-checked, and this row is the last thing standing between "old firmware
-// still runs" and "new firmware boots". It is placed in RAM (the section
-// attribute below lands it in .data, which the standard startup code already
-// copies from flash to RAM before main() runs - see Reset_Handler() in the
-// framework's cortex_handlers.c - so this requires no linker script changes)
-// and is written with NO calls to any other function: erase()/write() from
-// FlashStorage, Serial, memcpy, all of it lives in flash alongside the rest
-// of this application, and nothing in flash can be safely called into once
-// we've started rewriting it - not even to return to our own caller. This
-// function's only way out is the hardware reset at the end.
+// THIS IS THE ONLY CODE THAT EVER WRITES THE APPLICATION PARTITION, and the
+// reason for the whole staging design. This chip has one flash bank and no
+// read-while-write: erasing a row makes the entire flash array unreadable
+// until the operation completes, and a row that held executing code comes
+// back as 0xFF. So from the first erase below until the reset, this function
+// must not execute, call, or return into ANY code in flash - not FlashClass,
+// not Serial, not memcpy, not even its own caller.
+//
+// It satisfies that by living in RAM: the section attribute lands it in
+// .data, which the standard startup code already copies from flash to RAM
+// before main() runs (see Reset_Handler() in the framework's
+// cortex_handlers.c), so this needs no linker script changes. Everything it
+// touches is either a CPU register, a peripheral register, or IAProwBuf in
+// RAM. Note the deliberate ordering inside the loop: the staged row is read
+// into RAM *first*, while the NVM is idle and flash is readable, and only
+// then is the destination row erased and rewritten from that RAM copy.
+//
+// Rev 1.4's version of this (IAP_CommitRow0AndReset) was correct as far as it
+// went, and was confirmed working on hardware - but it only ever committed
+// row 0, because 1.4 wrongly streamed every other row straight over the
+// running application. See ProgramFLASHcmd() below.
 //
 // The build prints "warning: ignoring changed section attributes for .data"
 // for this function - expected and harmless (the assembler just means the
 // code bytes get .data's existing read/write flags rather than an
 // executable one; there's no MPU configured on this board to enforce that
-// distinction). Confirmed by disassembling the linked .elf that this
-// function does land at its .data/RAM address (`arm-none-eabi-nm` shows it
-// alongside the other globals, not in the .text range) and that the actual
-// NVMCTRL and SCB/AIRCR register writes below survive the build correctly.
+// distinction). Verify after any change to this function that it still lands
+// in RAM and calls nothing in flash:
+//   arm-none-eabi-nm  .pio/build/adafruit_feather_m0/firmware.elf | grep IAP_
+//     -> address must be 0x20xxxxxx, not 0x000xxxxx
+//   arm-none-eabi-objdump -d .pio/build/adafruit_feather_m0/firmware.elf
+//     -> its disassembly must contain no "bl" to a flash (0x0000xxxx) address
 __attribute__((noinline, section(".data")))
-static void IAP_CommitRow0AndReset(const uint8_t *row0Data)
+static void IAP_CopyStagingToAppAndReset(uint32_t numRows)
 {
+  volatile uint32_t *src;
   volatile uint32_t *dst;
-  const uint8_t     *src;
-  uint32_t           word;
+  uint32_t           appAddr, stageAddr, row, page, w;
 
-  // No interrupt handler's address can be trusted once row 0 (the vector
-  // table) is erased, so nothing may preempt us from here to the reset.
+  // Nothing may preempt us: every interrupt handler's code is in the
+  // application partition we are about to overwrite.
   __disable_irq();
-
-  // Erase row 0 (SAMD21 NVMCTRL ADDR takes a 16-bit half-word address).
-  NVMCTRL->ADDR.reg = APP_FLASH_START / 2;
-  NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_ER;
-  while (!NVMCTRL->INTFLAG.bit.READY) { }
 
   // Disable automatic page write so each 64-byte page is only committed when
   // we explicitly issue WP below (same sequence FlashStorage's FlashClass
   // uses, just inlined here with no external call).
   NVMCTRL->CTRLB.bit.MANW = 1;
 
-  dst = (volatile uint32_t *)APP_FLASH_START;
-  src = row0Data;
-  for (int page = 0; page < FLASH_ROW_SIZE / 64; page++)
+  for (row = 0; row < numRows; row++)
   {
-    // PBC: Page Buffer Clear
-    NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_PBC;
+    stageAddr = STAGE_FLASH_START + (row * FLASH_ROW_SIZE);
+    appAddr   = APP_FLASH_START   + (row * FLASH_ROW_SIZE);
+
+    // Read the staged row into RAM while the NVM is idle. The pointers are
+    // volatile so the compiler cannot turn this loop into a memcpy() call -
+    // memcpy lives in flash, and calling it here would be fatal.
+    src = (volatile uint32_t *)stageAddr;
+    dst = (volatile uint32_t *)IAProwBuf;
+    for (w = 0; w < FLASH_ROW_SIZE / 4; w++) dst[w] = src[w];
+
+    // Erase the destination row (NVMCTRL ADDR takes a 16-bit half-word
+    // address). From here until the last WP below, flash is unreadable.
+    NVMCTRL->ADDR.reg = appAddr / 2;
+    NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_ER;
     while (!NVMCTRL->INTFLAG.bit.READY) { }
-    for (int w = 0; w < 64 / 4; w++)
+
+    // Write it back from the RAM copy, one 64-byte page at a time.
+    src = (volatile uint32_t *)IAProwBuf;
+    dst = (volatile uint32_t *)appAddr;
+    for (page = 0; page < FLASH_ROW_SIZE / 64; page++)
     {
-      word  = (uint32_t)src[0];
-      word |= (uint32_t)src[1] << 8;
-      word |= (uint32_t)src[2] << 16;
-      word |= (uint32_t)src[3] << 24;
-      *dst++ = word;
-      src += 4;
+      // PBC: Page Buffer Clear
+      NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_PBC;
+      while (!NVMCTRL->INTFLAG.bit.READY) { }
+      for (w = 0; w < 64 / 4; w++) *dst++ = *src++;
+      // WP: Write Page
+      NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_WP;
+      while (!NVMCTRL->INTFLAG.bit.READY) { }
     }
-    // WP: Write Page
-    NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_WP;
-    while (!NVMCTRL->INTFLAG.bit.READY) { }
   }
 
   // System reset - the exact sequence CMSIS's NVIC_SystemReset() uses,
   // inlined here rather than called, so nothing outside this function is
-  // ever invoked from the moment row 0 is erased onward.
+  // ever invoked from the first erase onward.
   __DSB();
   SCB->AIRCR = (uint32_t)((0x5FAUL << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk);
   __DSB();
   for (;;) { }
+}
+// Erases and writes one row into the STAGING partition, then reads it back to
+// verify. Returns false on a mismatch.
+//
+// Unlike Rev 1.4's equivalent, this is safe to call from ordinary
+// flash-resident code, because staging never holds executing code. Interrupts
+// are still masked around the NVM operation: an erase or write makes the
+// WHOLE flash array unreadable while it is in flight, so any interrupt that
+// fired would fetch its handler from unreadable flash and fault. That hazard
+// belongs to the operation itself, not to which row is being written, and the
+// tight poll loop inside FlashClass runs from the NVM cache, which is why this
+// works at all.
+static bool StageRow(uint32_t addr, byte *data, byte *verifyBuf)
+{
+  FlashClass fc((void *)addr, FLASH_ROW_SIZE);
+
+  noInterrupts();
+  fc.erase();
+  fc.write(data);
+  fc.read(verifyBuf);
+  interrupts();
+  return (memcmp(data, verifyBuf, FLASH_ROW_SIZE) == 0);
+}
+
+// Re-reads the staged image straight out of flash and recomputes its CRC.
+// The per-row read-back in StageRow() already proves each row landed
+// correctly; this proves the image as a whole is intact and in the right
+// place, and it is the last thing checked before the irreversible copy.
+static bool StagedImageCRCok(int numBytes, byte expected)
+{
+  const uint8_t *p = (const uint8_t *)STAGE_FLASH_START;
+  byte           c = 0;
+
+  for(int i=0; i<numBytes; i++) ComputeCRCbyte(&c, p[i]);
+  return (c == expected);
 }
 
 // Field-updates this module's own firmware, received from the USB-connected
@@ -473,50 +532,56 @@ static void IAP_CommitRow0AndReset(const uint8_t *row0Data)
 // Comms::ARBupload() in the MIPS host app): the host sends the image size in
 // decimal, then the raw bytes of the image as ASCII hex (two characters per
 // byte), then a newline, then the 8-bit CRC (poly 0x1D, see ComputeCRC()) of
-// the whole image in decimal.
+// the whole image in decimal. "Next" is sent back after each complete row so
+// the host can pace itself.
 //
-// Safety design (see the Rev 1.4 entry in RFdriver.cpp and README.md for the
-// fuller writeup):
-//  - The image always starts at APP_FLASH_START; there is no host-supplied
-//    address anymore (removed one whole class of operator error - a typo'd
-//    address used to be able to overwrite anything in flash).
-//  - The image is rejected outright, before a single byte is written, if it's
-//    smaller than one FLASH row, larger than the available application flash,
-//    or its vector table doesn't look plausible (IsPlausibleVectorTable()).
-//  - Every row from the SECOND one onward is erased, written, and read back
-//    to verify, using the ordinary (flash-resident) FlashClass exactly as
-//    before; a mismatch aborts immediately.
-//  - The FIRST row - the vector table - is deliberately not written along
-//    the way. It's buffered in RAM and only committed, by the small
-//    RAM-resident IAP_CommitRow0AndReset() above, after the entire rest of
-//    the image has been written AND the whole-image CRC has checked out.
-//    That means any detected failure - a bad CRC, a verify mismatch, a
-//    timeout, a garbled header - leaves the OLD vector table (and therefore
-//    the currently-running firmware) completely untouched; the board keeps
-//    running normally rather than needing a recovery flash. Only a genuinely
-//    successful, fully-verified transfer ever touches row 0, and the moment
-//    it does, the board is already committed to resetting into the new
-//    image.
+// How this works, and why (see also README.md and the Rev 1.5 entry in
+// RFdriver.cpp):
+//
+//  - The incoming image is written into the STAGING partition, never over the
+//    running application. This is the whole point of the design. The chip has
+//    one flash bank and no read-while-write, so erasing a row that holds
+//    executing code hangs the CPU the moment it fetches the erased 0xFF back
+//    as an instruction. Rev 1.4 streamed straight over the running
+//    application and hard-hung every time it reached a row holding this very
+//    function - see the Rev 1.5 entry in RFdriver.cpp for the full postmortem.
+//    Staging holds no code, so receiving is completely safe: serial, USB and
+//    the command loop keep running normally throughout.
+//  - The image always lands at APP_FLASH_START in the end; there is no
+//    host-supplied address (that removed a whole class of operator error - a
+//    typo'd address used to be able to overwrite anything in flash).
+//  - It is rejected before anything is written if it is smaller than one FLASH
+//    row, larger than the application partition, or its vector table doesn't
+//    look plausible (IsPlausibleVectorTable()).
+//  - Every staged row is read back and verified as it is written; then the
+//    whole staged image is re-read and CRC'd again (StagedImageCRCok()) before
+//    the commit.
+//  - Only then does IAP_CopyStagingToAppAndReset() - RAM-resident, calling
+//    nothing in flash - copy staging over the application and reset. Any
+//    failure before that point (bad CRC, verify mismatch, timeout, implausible
+//    image, dropped connection) leaves the application partition completely
+//    untouched and the board running normally, with no recovery needed. That
+//    is the property Rev 1.4 claimed and did not actually have.
 //  - Both RF channels' drive level are forced to 0 before anything else, since
-//    the update blocks the normal 25 ms control loop for its entire
-//    duration (a bad idea to leave RF output running unsupervised for that
-//    long) and the drive PWM hardware otherwise keeps outputting whatever was
-//    last commanded, independent of what the CPU is doing.
+//    the update blocks the normal 25 ms control loop for its entire duration
+//    (a bad idea to leave RF output running unsupervised for that long) and
+//    the drive PWM hardware otherwise keeps outputting whatever was last
+//    commanded, independent of what the CPU is doing.
 //
-// What this does NOT protect against: a genuinely mid-row failure - power
-// loss or a dropped USB connection during the few milliseconds an individual
-// row's erase/write is in flight - can still leave the running application's
-// OWN code inconsistent (this board has one flash bank, not two, so there is
-// nowhere else to stage a full image; see README.md for why that tradeoff was
-// accepted for this module). Recovery in that case is the same physical
-// USB bootloader recovery this board already relies on for a bad initial
-// programming - open the enclosure, double-tap reset to force the board into
-// its SAM-BA bootloader (it appears as a new serial port, not a mass-storage
-// drive - this board's bootloader is the classic Arduino/bossac one, not the
-// UF2/drag-and-drop kind some other Adafruit SAMD boards use), then reflash
-// a known-good build with `pio run -t upload` or bossac directly. That
-// fallback is unaffected by anything here, since this function never touches
-// flash below APP_FLASH_START.
+// What this does NOT protect against: power loss or a reset during the final
+// copy itself. That window is now a few hundred milliseconds of flash-to-flash
+// copying rather than the multi-minute transfer it used to be, but it is still
+// there, and a failure inside it leaves the application partition incomplete.
+// Recovery is the same physical bootloader path this board already relies on
+// for a bad initial programming - open the enclosure, double-tap reset to
+// force the board into its SAM-BA bootloader (it appears as a new serial port,
+// not a mass-storage drive - this board's bootloader is the classic
+// Arduino/bossac one, not the UF2/drag-and-drop kind some other Adafruit SAMD
+// boards use), then reflash a known-good build. Note that `pio run -t upload`
+// does not work from an already-bootloader state (its 1200-baud touch-reset
+// assumes the application is running); use bossac directly, or reflash
+// immediately after the double-tap. That fallback is unaffected by anything
+// here, since nothing in this file ever touches flash below APP_FLASH_START.
 void ProgramFLASHcmd(char *sizeStr)
 {
   static String sToken;
@@ -524,14 +589,13 @@ void ProgramFLASHcmd(char *sizeStr)
   static char   c,buf[3],*Token;
   static byte   fbuf[FLASH_ROW_SIZE],crc;
   static byte   vbuf[FLASH_ROW_SIZE];
-  static byte   row0[FLASH_ROW_SIZE];
   static uint32_t start;
-  uint32_t      flashAddress;
-  bool          haveRow0;
+  uint32_t      stageAddress,numRows;
+  bool          checkedRow0;
 
   sToken = sizeStr;
   numBytes = sToken.toInt();
-  if((numBytes <= FLASH_ROW_SIZE) || (numBytes > (int)(APP_FLASH_END - APP_FLASH_START)))
+  if((numBytes <= FLASH_ROW_SIZE) || (numBytes > (int)APP_MAX_SIZE))
   {
     SetErrorCode(ERR_BADARG);
     SendNAK;
@@ -543,8 +607,8 @@ void ProgramFLASHcmd(char *sizeStr)
   crc = 0;
   SendACK;
   fi = 0;
-  haveRow0 = false;
-  flashAddress = APP_FLASH_START;
+  checkedRow0 = false;
+  stageAddress = STAGE_FLASH_START;
   for(int i=0; i<numBytes; i++)
   {
     start = millis();
@@ -560,53 +624,38 @@ void ProgramFLASHcmd(char *sizeStr)
     if(fi == FLASH_ROW_SIZE)
     {
       fi = 0;
-      if(flashAddress == APP_FLASH_START)
+      if(!checkedRow0)
       {
-        // Row 0: the vector table. Buffer it and sanity-check it, but do not
-        // write it yet - see the safety design note above.
-        memcpy(row0, fbuf, FLASH_ROW_SIZE);
-        if(!IsPlausibleVectorTable(row0))
+        // Row 0 is the vector table. Sanity-check it before we write anything
+        // at all, so an obviously-wrong file costs nothing.
+        if(!IsPlausibleVectorTable(fbuf))
         {
           serial->println("Image does not look like a valid firmware image for this board - aborted, nothing written.");
           SetErrorCode(ERR_BADARG);
           SendNAK;
           return;
         }
-        haveRow0 = true;
+        checkedRow0 = true;
       }
-      else
+      if(!StageRow(stageAddress, fbuf, vbuf))
       {
-        FlashClass fc((void *)flashAddress, FLASH_ROW_SIZE);
-        noInterrupts();
-        fc.erase();
-        fc.write(fbuf);
-        fc.read(vbuf);
-        interrupts();
-        if(memcmp(fbuf, vbuf, FLASH_ROW_SIZE) != 0)
-        {
-          serial->println("FLASH verify error - aborted. The old firmware's vector table was never touched; it is still running normally.");
-          SendNAK;
-          return;
-        }
-        serial->println("Next");
+        serial->println("FLASH verify error while staging - aborted. The application partition was never touched; the old firmware is still running normally.");
+        SendNAK;
+        return;
       }
-      flashAddress += FLASH_ROW_SIZE;
+      serial->println("Next");
+      stageAddress += FLASH_ROW_SIZE;
     }
   }
-  // If fi is > 0 then write the last partial block to FLASH, padded with
-  // 0xFF (the erased-flash value).
+  // If fi is > 0 then stage the last partial block, padded with 0xFF (the
+  // erased-flash value). No "Next" for a partial row - the host doesn't wait
+  // for one (see Comms::ARBupload(), which only waits after full blocks).
   if(fi > 0)
   {
     while(fi < FLASH_ROW_SIZE) fbuf[fi++] = 0xFF;
-    FlashClass fc((void *)flashAddress, FLASH_ROW_SIZE);
-    noInterrupts();
-    fc.erase();
-    fc.write(fbuf);
-    fc.read(vbuf);
-    interrupts();
-    if(memcmp(fbuf, vbuf, FLASH_ROW_SIZE) != 0)
+    if(!StageRow(stageAddress, fbuf, vbuf))
     {
-      serial->println("FLASH verify error on final block - aborted. The old firmware's vector table was never touched; it is still running normally.");
+      serial->println("FLASH verify error staging the final block - aborted. The application partition was never touched; the old firmware is still running normally.");
       SendNAK;
       return;
     }
@@ -616,23 +665,31 @@ void ProgramFLASHcmd(char *sizeStr)
   while((c = RB_Get(&RB)) == 0xFF) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
   if(c == '\n')
   {
-    // Get CRC and test, if ok commit row 0 and reset; else abort
+    // Get CRC and test, if ok commit the staged image and reset; else abort
     while((Token = GetToken(true)) == NULL) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
     sscanf(Token,"%d",&tcrc);
     while((Token = GetToken(true)) == NULL) { ProcessSerial(false); if(millis() > start + 10000) goto TimeoutExit; }
-    if((Token[0] == '\n') && (crc == tcrc) && haveRow0)
+    if((Token[0] == '\n') && (crc == tcrc) && checkedRow0)
     {
-       serial->println("Image received and verified. Committing the vector table and resetting into the new firmware...");
-       delay(50);   // give the message time to actually go out over USB before we reset
-       IAP_CommitRow0AndReset(row0);
-       // Never reached.
+      // Last check before the point of no return.
+      if(!StagedImageCRCok(numBytes, crc))
+      {
+        serial->println("Staged image failed its read-back CRC - aborted. The application partition was never touched; the old firmware is still running normally.");
+        SendNAK;
+        return;
+      }
+      numRows = (numBytes + FLASH_ROW_SIZE - 1) / FLASH_ROW_SIZE;
+      serial->println("Image received and verified. Copying it over the application and resetting into the new firmware...");
+      delay(50);   // give the message time to actually go out over USB before we reset
+      IAP_CopyStagingToAppAndReset(numRows);
+      // Never reached.
     }
   }
-  serial->println("\nCRC mismatch or malformed transfer - update aborted. The old firmware's vector table was never touched; it is still running normally.");
+  serial->println("\nCRC mismatch or malformed transfer - update aborted. The application partition was never touched; the old firmware is still running normally.");
   SendNAK;
   return;
 TimeoutExit:
-  serial->println("\nFirmware update timed out - aborted. The old firmware's vector table was never touched; it is still running normally.");
+  serial->println("\nFirmware update timed out - aborted. The application partition was never touched; the old firmware is still running normally.");
   SendNAK;
   return;
 }

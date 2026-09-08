@@ -6,77 +6,97 @@ stepping stone (proving the on-module mechanism works) and as the recovery
 path if an update ever fails partway through. This file tracks what's left
 to get from "works over USB" to "works over TWI, from the host app."
 
-## 0. Prerequisite - do not start on anything below until this passes
+## 0. Prerequisite - DONE (Rev 1.5, September 8, 2026)
 
-- [ ] [checklist.md](checklist.md) §10 (firmware update over direct USB)
-      passes in full, on a bench unit, including the deliberately-bad-file
-      and recovery-path checks. The TWI relay adds a slower, less reliable
-      transport on top of the same mechanism - it's not worth building until
-      the mechanism itself is proven.
+- [x] **`PGM` redesigned to stage in spare flash, then commit from RAM.**
+      Rev 1.4 was fundamentally broken - it erased the flash rows holding the
+      code it was executing and hard-hung the board at row 10 (`0x2A00`)
+      every time. Rev 1.5 partitions flash (application `0x2000-0x21000`,
+      staging `0x21000-0x40000`), receives into staging, re-reads and CRCs
+      the staged image, and only then runs the RAM-resident
+      `IAP_CopyStagingToAppAndReset()`. See the README's "Firmware field
+      update" section and the Rev 1.5 entry in `src/RFdriver.cpp`.
+- [x] [checklist.md](checklist.md) §10 passes over direct USB, including the
+      deliberately-bad-file, dropped-transfer and recovery-path checks, and a
+      genuine v1.5 -> v1.4 version change. Full 77984-byte round trip takes
+      ~13 s.
+- [x] [checklist.md](checklist.md) §11 passes through the MIPS TWI relay -
+      the actual goal of this file. See §4 below.
 
-## 1. MIPS host app (`MIPSapp/MIPS_QT6`) - new upload path
+(Two smaller items that were open here are now tracked in §5.)
 
-Nothing here exists yet; `TWITALK` (the relay command) is never called
-anywhere in the Qt app today.
+## 1. Host-side upload path - SUPERSEDED, use `pgm_update.py`
 
-- [ ] New `Comms` method, mirroring `Comms::ARBupload()` in `comms.cpp`
-      (address+size header, hex-encoded body in chunks, CRC trailer) but:
-      1. First opens the tunnel: `SendCommand("TWITALK," + board + "," +
-         twiAddr + "\n")` (or `TWI1TALK` if the target is on the `Wire1` bus)
-      2. Runs the transfer as `"PGM," + size + "\n"` instead of
-         `"ARBPGM," + addr + "," + size + "\n"` - no address argument, see
-         [README.md](README.md)
-      3. Always closes the tunnel afterward by sending ESC (`0x1B`), success
-         or failure, so MIPS doesn't get left stuck relaying
-- [ ] UI entry point: free-text board/address prompt + file picker, matching
-      the existing ARB upload action in `mips.cpp` / `fileops.cpp` and the
-      `PutEEPROM()` convention (`Board`, `TWI address`) already used
-      elsewhere. **Decided: no dropdown, no discovery UI** - this is a
-      developer tool for field updates, not an end-user feature, so
-      free-text board+address input is the whole UI; it does not need to be
-      friendlier than that.
+~~Originally planned as a new feature inside `MIPSapp/MIPS_QT6`~~ - decided
+against building this into the Qt app. [pgm_update.py](pgm_update.py) (added
+alongside checklist.md item 10) already does the job and is a better fit:
+this is a developer/field-update tool, not an end-user feature, so it
+doesn't need to live inside the operator-facing app. It supports both
+transports:
 
-## 2. Decisions needed (not mine to make)
+- Direct-USB (`pgm_update.py --file <img>`) - checklist.md §10, passing.
+- TWI relay (`pgm_update.py --file <img> --twi <board>,<addr>` or `--wire1`)
+  - opens the tunnel with `TWITALK`/`TWI1TALK`, runs the transfer as
+    `"PGM," + size + "\n"` (no address argument, see README.md), and always
+    sends ESC (`0x1B`) afterward, success or failure, so MIPS doesn't get
+    left stuck relaying. Verified against real hardware - checklist.md §11,
+    passing.
 
-- [ ] Acceptable transfer time. The relay forwards host->slave bytes one at a
-      time, one I2C transaction per byte with a 1ms delay between each
-      (`twitalk()` in the MIPS firmware) - for an ~80KB image at 2 hex
-      characters per byte that's on the order of many minutes, unmeasured.
-      Worth benchmarking directly-over-USB first (checklist §10 records this)
-      to get a real baseline, then estimating the TWI multiplier before
-      deciding this is acceptable as-is
+No UI entry point needed - free-text `--port`/`--twi board,addr` flags on
+the command line are the whole interface, matching the "no dropdown, no
+discovery UI" call already made when this was scoped as a Qt feature.
+
+## 2. Decisions needed - ANSWERED
+
+- [x] Acceptable transfer time. **Measured: 162.5 s (2 m 43 s)** for the full
+      77984-byte image through the relay, versus ~13 s over direct USB - about
+      12.8x. The relay forwards host->slave one byte per I2C transaction with a
+      `delay(1)` between each, so that is close to the floor without changing
+      `twitalk()` itself. Under three minutes for a field update that avoids
+      opening an enclosure seems clearly acceptable; no further optimisation
+      pursued.
 - [ ] Whether an update should be blockable/disallowed while the system is
-      actively running an experiment, given item 3's system-wide freeze
+      actively running an experiment. Still open, and now better informed: the
+      module holds RF drive off for the whole ~3 minutes, and the relay ties up
+      the MIPS TWI bus and its host serial port for that time too. This is a
+      policy call, not a technical one.
 
-## 3. MIPS firmware (`platformIO/MIPS`) - things to verify, not necessarily fix
+## 3. MIPS firmware (`platformIO/MIPS`) - VERIFIED, no changes needed
 
-- [ ] `twitalk()`'s slave->host relay drops any byte equal to 120 (`'x'`) or
-      255 (`0xFF`) before forwarding it to the host (see `Serial.cpp` in the
-      MIPS firmware). This silently corrupts RFdriver's own `"Next"` progress
-      message (it contains an `'x'`) when relayed. Traced through
-      `Comms::ARBupload()`'s `getline()`/`waitforline()` logic and confirmed
-      this is harmless for that specific check (it only tests for a
-      non-empty line, not its content) - but it's a real, existing quirk of
-      shared infrastructure, not something to silently patch without
-      understanding why the filter is there for other module types. Flag it
-      if a future protocol change ever needs the exact content of a relayed
-      line to matter.
-- [ ] Confirm the watchdog (`WDT_Restart(WDT)`, called once per `twitalk()`
-      loop iteration) doesn't trip during a multi-minute relayed transfer -
-      should be fine given how tight that loop is, but unverified over a
-      real multi-minute run.
-- [ ] Confirm `twitalk()` behaves correctly if the *target* module resets
-      mid-session (which is exactly what a successful `PGM` does on
-      purpose) - does MIPS notice the TWI address stop responding and exit
-      cleanly, or does it hang until the host sends ESC? A successful update
-      ends with RFdriver resetting itself; the host-side code from item 1
-      needs to know to send ESC (or just stop) at that point rather than
-      wait for a response that will never come from mid-reset silicon.
+All three concerns were exercised by the §11 hardware run and none needs a fix.
+See [checklist.md](checklist.md) §11 for the evidence.
 
-## 4. End-to-end validation, once 1-3 are done
+- [x] The `'x'`/`0xFF` slave->host byte filter is harmless here. "Next" arrives
+      as "Net"; the host treats any non-empty line as an ack. No message the
+      RFdriver firmware prints contains `'x'` or `0xFF` - keep it that way when
+      editing those strings.
+- [x] The watchdog survives a multi-minute relayed transfer - two full 162 s
+      transfers, no MIPS reset. **But only because the host waits for each
+      row's "Next" before sending the next row.** `twitalk()` kicks the
+      watchdog in its outer loop only, and its inner drain loop runs `delay(1)`
+      per byte with no kick, so an unpaced host would sit in that loop for
+      minutes and reset MIPS. The per-row handshake is load-bearing.
+- [x] `twitalk()` when the target resets mid-session: MIPS stays in the relay
+      loop polling a silent address until the host sends ESC, which
+      `pgm_update.py` always does in a `finally` block. MIPS exited cleanly
+      every time. After the reset the module is in normal mode, so verifying
+      the new version needs a fresh `TWITALK`.
 
-- [ ] New checklist section (in this file's companion `checklist.md`, or a
-      MIPS-side equivalent) mirroring §10 but exercised through `TWITALK`
-      from the actual MIPS controller - same recovery-first discipline:
-      confirm direct-USB recovery still works before trusting the relayed
-      path with a unit that matters.
+## 4. End-to-end validation - DONE
+
+- [x] [checklist.md](checklist.md) §11 records a full relayed update against
+      real hardware (MIPS v1.264, board 0, TWI address 112): tunnel open/close,
+      a complete 77984-byte update with reset and version re-check, and a
+      deliberately-bad-CRC run that was rejected with the module still running.
+
+## 5. Remaining work
+
+- [ ] Harden the NVM busy-waits. `FlashClass`'s
+      `while (!NVMCTRL->INTFLAG.bit.READY) {}` never checks the lock/program
+      error flags, so any NVM error hangs the board forever with interrupts off
+      instead of failing with a NAK. Not the cause of the Rev 1.4 hang, but the
+      same class of unrecoverable failure.
+- [ ] Verify the RF-drive-off behaviour with a scope (checklist §10) - it
+      cannot be checked over serial, since `GRFDRV` reports the setpoint rather
+      than the PWM state.
+- [ ] Decide the "block updates during an experiment?" policy question in §2.

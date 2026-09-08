@@ -14,3 +14,7 @@
 # firmware/*.bin is intentionally NOT ignored - those are the versioned
 # release images publish_firmware.py produces, used by the PGM field-update
 # command and as known-good recovery images (see firmware/README.md).
+
+# Python bytecode (pgm_update.py)
+__pycache__/
+*.pyc
