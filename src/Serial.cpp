@@ -75,6 +75,7 @@ Commands  CmdArray[] =   {
   {"GRFALL", CMDfunction, 0, (char *)RFreportAll},                 // Reports Freq, RFVpp + and - for each RF channel in system
   {"TUNERFCH", CMDfunction, 1, (char *)RFautoTune},                // Auto tune the select RF channel
   {"RETUNERFCH", CMDfunction, 1, (char *)RFautoRetune},            // Auto retune the select RF channel, start and current freq and drive
+  {"SRFTFR", CMDbool, 1, (char *)&TuneFullRange},                  // If TRUE the first step of auto tune will use the full range
   {"SRFCAL", CMDfunctionLine, 1, (char *)RFcalParms},              // Sets the RF calibration parameters, channel,slope,intercept  
   {"RFCALP", CMDfunctionStr, 2, (char *)RFcalP},                   // Adjust the calibration for a RF+ channel, channel,actual level in Vp-p, enter negative to set defaults
   {"RFCALN", CMDfunctionStr, 2, (char *)RFcalN},                   // Adjust the calibration for a RF- channel, channel,actual level in Vp-p, enter negative to set defaults

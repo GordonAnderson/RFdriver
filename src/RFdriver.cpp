@@ -127,7 +127,7 @@
 SoftwareI2C WireS1;
 
 int8_t        TWIadd = 0x50;
-const char    Version[] PROGMEM = "RFdriver version 1.5, September 8, 2026";
+const char    Version[] PROGMEM = "RFdriver version 1.6, October 6, 2026";
 RFdriverData  rfdriver;
 RFDRVstate    sdata[2];
 int           recAdd;    
@@ -188,6 +188,10 @@ bool RetuneRequest = false;
 bool Tuning        = false;
 bool TuneReport    = false;
 int  TuneRFChan;
+// If true the first step of auto tune (TUNE_SCAN_UP at the largest step size) will scan the
+// full MinFreq to MaxFreq range instead of stopping early once the peak starts dropping off,
+// mirrors TuneRFfullRange/SRFTFR on the MIPS controller.
+bool TuneFullRange = false;
 // Tune states
 #define TUNE_SCAN_DOWN 1
 #define TUNE_SCAN_UP 2
@@ -460,6 +464,25 @@ void receiveEventProcessor(int howMany)
     {
       case TWI_SERIAL:
         serial = &sb;
+        break;
+      case TWI_CMD:
+        // Process command using the serial processor
+        sb.clear();
+        serial = &sb;
+        // Read the ascii string and place in the serial processor ring buffer.
+        for(i=0;i<100;i++)
+        {
+          if(Wire.available() != 0)
+          {
+            cmd = Wire.read();
+            PutCh(cmd);
+            if(cmd == '\n') break;
+          }
+          delayMicroseconds(100);
+        }
+        // Process any commands fill sb buffer with results
+        while (RB_Commands(&RB) > 0) while (ProcessCommand() == 0);
+        serial = &Serial;
         break;
       case TWI_SET_CHAN:
         if((i=ReadUnsignedByte()) == -1) break;
@@ -899,11 +922,12 @@ void RFdriver_tune(void)
           FreqMax = rfdriver.RFCD[TuneRFChan].Freq;
         }
         if(Current <= (Last +1)) NumDown++;
-        else 
+        else
         {
           NumDown = 0;
           if(TuneStep == 100000) NumDown = -MaxNumDown;
         }
+        if((TuneFullRange) && (TuneStep == 100000)) NumDown = 0;
         rfdriver.RFCD[TuneRFChan].Freq += TuneStep;
         if((NumDown >= MaxNumDown) || (rfdriver.RFCD[TuneRFChan].Freq > 5000000))
         {

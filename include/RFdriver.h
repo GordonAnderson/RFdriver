@@ -43,6 +43,7 @@
                                          
 
 #define TWI_SERIAL             0x27      // This command enables the TWI port to process serial commands
+#define TWI_CMD                0x7F      // This command sends a ascii string to the serial command processor
 
 #define TWI_READ_READBACKS     0x81      // Returns the readback structure
 #define TWI_READ_AVALIBLE      0x82      // Returns the number of bytes avalible in output buffer, 16 bit unsigned int
@@ -137,6 +138,7 @@ extern RFdriverData  rfdriver;
 extern ThreadController control;
 extern Thread SystemThread;
 extern SoftwareI2C WireS1;
+extern bool TuneFullRange;
 
 
 // prototypes
